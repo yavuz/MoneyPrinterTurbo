@@ -268,6 +268,25 @@ def _replicate_generate(
     return _download_image(image_url, deadline, verify)
 
 
+# Gemini 的 generateContent 主要由文字提示词驱动构图，光靠 imageConfig 有时不足以
+# 保证竖屏/横屏取景。这里把画幅方向也写进提示词，让模型按目标画幅安排构图。
+_ASPECT_ORIENTATION = {
+    "9:16": "vertical portrait",
+    "16:9": "horizontal landscape",
+    "1:1": "square",
+}
+
+
+def _aspect_prompt_hint(aspect_ratio: str) -> str:
+    orientation = _ASPECT_ORIENTATION.get(aspect_ratio)
+    if orientation:
+        return (
+            f"Aspect ratio {aspect_ratio}: frame the full scene for a "
+            f"{orientation} composition."
+        )
+    return f"Aspect ratio {aspect_ratio}."
+
+
 def _extract_gemini_image(payload: dict) -> bytes:
     """从 Gemini generateContent 响应里取出第一张内联图片并解码为字节。"""
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
@@ -308,14 +327,19 @@ def _gemini_generate(
         config.app.get("gemini_base_url") or _DEFAULT_GEMINI_BASE_URL
     ).strip().rstrip("/")
     url = f"{base_url}/v1beta/models/{model}:generateContent"
+    # 明确记录真正请求的模型，方便用户核对是否在用 Nano Banana Pro
+    # （gemini-3-pro-image）还是更轻量的 Flash / Flash Lite。
+    logger.info(f"requesting Gemini image: model={model}, aspect={aspect_ratio}")
     headers = {
         "x-goog-api-key": api_key,
         "Content-Type": "application/json",
     }
     # Nano Banana Pro 通过 generateContent 同步返回内联图片，无需队列轮询。
-    # imageConfig.aspectRatio 直接接受 "9:16" 这类比例，与 VideoAspect 对齐。
+    # imageConfig.aspectRatio 直接接受 "9:16" 这类比例，与 VideoAspect 对齐；
+    # 同时把方向写进文字提示词，双保险地引导竖屏/横屏取景。
+    full_prompt = f"{prompt}\n\n{_aspect_prompt_hint(aspect_ratio)}"
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {
             "responseModalities": ["Image"],
             "imageConfig": {"aspectRatio": aspect_ratio},
@@ -488,7 +512,7 @@ def _generate_batch(runtime: "_Runtime", image_prompts: list) -> tuple:
     if pending:
         logger.info(
             f"generating {len(pending)}/{total} images via {runtime.provider} "
-            f"({runtime.resolution})"
+            f"[model={runtime.model_tag}] ({runtime.resolution})"
         )
         with ThreadPoolExecutor(
             max_workers=runtime.max_workers, thread_name_prefix="mpt-image-gen"

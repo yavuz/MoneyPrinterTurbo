@@ -317,6 +317,10 @@ class TestGeminiHttpFlow(TestImageGenBase):
             captured["json"]["generationConfig"]["imageConfig"]["aspectRatio"],
             "9:16",
         )
+        # 画幅方向也写进文字提示词，引导竖屏构图。
+        sent_text = captured["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("9:16", sent_text)
+        self.assertIn("vertical portrait", sent_text)
 
     def test_gemini_missing_api_key_raises_config_error(self):
         config.app["image_provider"] = "gemini"
