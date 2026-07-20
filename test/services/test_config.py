@@ -82,6 +82,31 @@ class TestConfigPersistence:
             config._cfg.clear()
             config._cfg.update(original_cfg)
 
+    def test_save_config_fallback_on_os_replace_error(self):
+        """当 os.replace 抛出 OSError 时（例如 Docker 挂载单个文件），应降级为直接写入。"""
+        original_cfg = dict(config._cfg)
+        original_app = dict(config.app)
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text("initial = true\n", encoding="utf-8")
+                config.app["fallback_test"] = "fallback_ok"
+                with (
+                    patch.object(config, "root_dir", temp_dir),
+                    patch.object(config, "config_file", str(config_path)),
+                    patch("os.replace", side_effect=OSError(16, "Device or resource busy")),
+                ):
+                    config.save_config()
+
+                saved_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                assert saved_config["app"]["fallback_test"] == "fallback_ok"
+                assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
+        finally:
+            config.app.clear()
+            config.app.update(original_app)
+            config._cfg.clear()
+            config._cfg.update(original_cfg)
+
     def test_runtime_config_lock_blocks_concurrent_config_writes(self):
         """长任务持有运行锁时，其它会话不能在任务中途改写全局配置。"""
         write_started = threading.Event()

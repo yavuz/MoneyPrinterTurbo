@@ -283,7 +283,16 @@ def save_config():
                 f.write(serialized_config)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(temp_path, config_file)
+            try:
+                os.replace(temp_path, config_file)
+            except OSError as e:
+                # EBUSY (16) happens when the config file is mounted directly via docker volume.
+                # In this case, we fallback to writing directly to the config file.
+                logger.warning(f"atomic replace failed ({e}), falling back to direct write")
+                with open(config_file, mode="w", encoding="utf-8") as f:
+                    f.write(serialized_config)
+                    f.flush()
+                    os.fsync(f.fileno())
             _cfg.clear()
             _cfg.update(config_to_save)
         finally:

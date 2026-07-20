@@ -686,6 +686,159 @@ Please note that you must use English for generating video search terms; Chinese
     return search_terms
 
 
+def generate_image_prompts(
+    video_subject: str,
+    video_script: str,
+    amount: int = 5,
+) -> List[str]:
+    """为 ``video_source = "ai"`` 生成分镜级文生图提示词。
+
+    与 ``generate_terms``（面向库存视频检索的 1-3 词关键词）不同，这里输出的是
+    适合 fal.ai / Replicate 等文生图模型的完整视觉描述：主体、场景、镜头、
+    光线、风格。提示词按文案叙述顺序排列，确保画面与旁白对应。返回严格等于
+    ``amount`` 条，便于按时间线切片；不足或过多都会被截断/补齐。
+    """
+    amount = max(1, int(amount))
+    prompt = f"""
+# Role: AI Image Prompt Generator
+
+## Goals:
+Generate exactly {amount} text-to-image prompts that visually illustrate the
+video script, one prompt per scene, in the same order as the narration.
+
+## Constrains:
+1. return the prompts as a json-array of exactly {amount} strings.
+2. each prompt is a single self-contained visual description (subject, setting,
+   camera framing, lighting, art style). 12-40 words. no scene numbers.
+3. keep the prompts in narration order; earlier prompts describe earlier moments.
+4. you must only return the json-array of strings. do not return anything else,
+   and do not return the script.
+5. write the prompts in English only.
+6. do not include any text, captions, watermarks or logos inside the images.
+
+## Output Example:
+["cinematic wide shot of a lone hiker on a misty mountain ridge at sunrise, warm golden light, photorealistic", "close-up of hands counting coins on a wooden table, soft window light, shallow depth of field"]
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+""".strip()
+
+    logger.info(f"generating {amount} image prompts, subject: {video_subject}")
+
+    prompts: List[str] = []
+    response = ""
+    for i in range(_max_retries):
+        try:
+            response = _generate_response(prompt)
+            if response.startswith("Error: "):
+                logger.error(f"failed to generate image prompts: {response}")
+                return []
+            prompts = json.loads(_strip_code_fence(response))
+            if not isinstance(prompts, list) or not all(
+                isinstance(item, str) for item in prompts
+            ):
+                logger.error("image prompt response is not a list of strings.")
+                prompts = []
+                continue
+        except Exception as e:
+            logger.warning(f"failed to generate image prompts: {str(e)}")
+            if response:
+                match = re.search(r"\[.*]", response, re.DOTALL)
+                if match:
+                    try:
+                        prompts = json.loads(match.group())
+                    except Exception as parse_error:
+                        logger.warning(
+                            f"failed to parse image prompts json: {str(parse_error)}"
+                        )
+
+        prompts = [item.strip() for item in prompts if isinstance(item, str) and item.strip()]
+        if prompts:
+            break
+        if i < _max_retries:
+            logger.warning(f"failed to generate image prompts, trying again... {i + 1}")
+
+    if not prompts:
+        return []
+
+    # 数量对齐时间线切片：多余的截断，不足的用已有提示词循环补齐，
+    # 保证下游按 audio_duration/clip_duration 的估算能拿到足够画面。
+    if len(prompts) > amount:
+        prompts = prompts[:amount]
+    elif len(prompts) < amount:
+        prompts = [prompts[idx % len(prompts)] for idx in range(amount)]
+
+    logger.success(f"completed: generated {len(prompts)} image prompts")
+    return prompts
+
+
+# text-to-music 供应商（如 Lyria）的提示词上限通常为 1000 字符。这里保守收敛到
+# 一句简短描述，既留出余量又避免模型跑题输出整段说明。
+MAX_MUSIC_PROMPT_LENGTH = 600
+
+
+def generate_music_prompt(video_subject: str, video_script: str) -> str:
+    """根据视频主题和脚本生成一句背景音乐提示词，供 text-to-music 配乐使用。
+
+    面向 Lyria 这类 *text-to-music* 供应商：它们不分析视频，只按文字提示词作曲。
+    这里让 LLM 依据视频的主题与情绪，输出单行英文的纯器乐背景乐描述（风格/流派、
+    乐器、速度、情绪、无人声）。失败或无输入时返回空字符串，由调用方回退到供应商
+    的通用默认提示词，绝不因为配乐提示词生成失败而中断整条视频任务。
+    """
+    subject = str(video_subject or "").strip()
+    script = str(video_script or "").strip()
+    if not subject and not script:
+        return ""
+
+    prompt = f"""
+# Role: Background Music Prompt Generator
+
+## Goal
+Write ONE short prompt describing instrumental background music that fits the
+mood and topic of the video below, for a text-to-music model.
+
+## Constraints
+1. return a single line of plain text, no quotes, no markdown, no explanation.
+2. describe genre/style, key instruments, tempo and mood. keep it under 40 words.
+3. instrumental only: no vocals, no lyrics, no singing.
+4. no artist names, no song titles, no copyrighted references.
+5. write in English.
+
+## Video Subject
+{subject}
+
+## Video Script
+{script}
+""".strip()
+
+    logger.info(f"generating music prompt, subject: {subject}")
+
+    try:
+        response = _generate_response(prompt)
+    except Exception as e:  # noqa: BLE001 - 配乐提示词是可选增强，失败即回退
+        logger.warning(f"failed to generate music prompt: {str(e)}")
+        return ""
+    if not response or response.startswith("Error: "):
+        logger.warning(f"failed to generate music prompt: {response}")
+        return ""
+
+    # 收敛为单行：去掉代码围栏，取第一段非空行，去掉首尾引号并压平内部空白。
+    stripped = _strip_code_fence(response)
+    first_line = next(
+        (line.strip() for line in stripped.splitlines() if line.strip()), ""
+    )
+    text = " ".join(first_line.strip('"').strip("'").strip().split())
+    if len(text) > MAX_MUSIC_PROMPT_LENGTH:
+        text = text[:MAX_MUSIC_PROMPT_LENGTH].rstrip()
+    if text:
+        logger.success(f"completed: generated music prompt: {text}")
+    return text
+
+
 # =============================================================================
 # Social publishing metadata
 #

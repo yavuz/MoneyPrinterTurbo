@@ -33,7 +33,7 @@ tls_verify = true
 # Video Materials / 视频素材
 # -----------------------------------------------------------------------------
 
-# Available values: "pexels", "pixabay", "coverr", "local".
+# Available values: "pexels", "pixabay", "coverr", "local", "ai".
 video_source = "pexels"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
@@ -64,6 +64,34 @@ twelvelabs_rerank_terms = false
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
 
+# --- AI image source (video_source = "ai") ----------------------------------
+# When video_source = "ai", scene prompts are sent to a text-to-image service
+# and the generated stills are animated into clips instead of using stock
+# footage. Choose the provider with image_provider.
+# Available values: "fal", "replicate", "gemini".
+image_provider = "fal"
+
+# fal.ai — API key: https://fal.ai/dashboard/keys
+fal_api_key = ""
+# Optional model override (default: fal-ai/flux/schnell).
+# fal_model_name = "fal-ai/flux/schnell"
+
+# Replicate — API token: https://replicate.com/account/api-tokens
+replicate_api_token = ""
+# Optional model override (default: black-forest-labs/flux-schnell).
+# replicate_model_name = "black-forest-labs/flux-schnell"
+
+# Google Gemini (Nano Banana Pro). Reuses gemini_api_key from the LLM section.
+# Default model is gemini-3-pro-image (Nano Banana Pro); uncomment to override.
+# gemini_image_model_name = "gemini-3-pro-image"
+
+# Shared generation tuning (optional). Uncomment to override the defaults.
+# image_gen_timeout = 120            # per-image budget in seconds
+# image_gen_poll_interval = 3.0      # queue poll interval (fal/replicate)
+# image_gen_max_retries = 2          # retries per image on transient failure
+# image_gen_max_concurrency = 4      # parallel image generations
+# image_gen_max_images = 40          # hard cap on AI images per video
+
 # Optional Sonilo video-matched original background music.
 # Create a key at https://platform.sonilo.com/dashboard. The WebUI can also save
 # this value, or you can set the SONILO_API_KEY environment variable instead.
@@ -71,6 +99,15 @@ sonilo_api_key = ""
 sonilo_base_url = "https://api.sonilo.com"
 # 单次生成流连续无数据时的最长等待秒数；它不是整个请求的总耗时上限。
 sonilo_timeout = 600
+
+# Optional Google Lyria 3 text-to-music background music (bgm_type = "lyria").
+# Unlike Sonilo/ElevenLabs (video-matched), Lyria generates music from a text
+# prompt; the service loops/trims the result to the narration length. Reuses the
+# gemini_api_key from the LLM section (or the GEMINI_API_KEY environment variable).
+# Default model is lyria-3-pro-preview; lyria-3-clip-preview generates 30s clips.
+# lyria_model_id = "lyria-3-pro-preview"
+# lyria_base_url = "https://generativelanguage.googleapis.com"
+# lyria_timeout = 600
 
 # -----------------------------------------------------------------------------
 # LLM Providers / 大模型提供商

@@ -1370,3 +1370,76 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
         valid_materials.append(material)
 
     return valid_materials
+
+
+def create_image_clip_files(image_paths: List[str], clip_duration: int = 5) -> List[str]:
+    """把可信的本地图片转成带 Ken Burns 效果的 mp4 片段，返回视频路径列表。
+
+    与 ``preprocess_video`` 的区别：
+      - 输入路径来自内部图片生成流程（``image_gen``），是可信的绝对路径，
+        因此不做 ``local_videos`` 目录约束；``preprocess_video`` 面向 API
+        传入的不可信路径，必须限制目录防止任意文件读取。
+      - 输出 mp4 与源图片同名（``{image}.mp4``）。已存在且有效时直接复用，
+        这样“断点续跑”不仅跳过重复的图片生成，也跳过重复的视频转码。
+    """
+    video_files: List[str] = []
+    for image_path in image_paths:
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"skip missing generated image: {image_path}")
+            continue
+
+        video_file = f"{image_path}.mp4"
+        # 复用已生成的片段，避免重复转码。用 VideoFileClip 探测有效性，
+        # 损坏文件重新生成。
+        if os.path.exists(video_file) and os.path.getsize(video_file) > 0:
+            probe = None
+            try:
+                probe = _open_video_clip_quietly(video_file)
+                if probe.duration and probe.duration > 0:
+                    logger.info(f"reuse existing image clip: {video_file}")
+                    video_files.append(video_file)
+                    continue
+            except Exception:
+                logger.warning(f"invalid cached image clip, regenerating: {video_file}")
+            finally:
+                if probe is not None:
+                    close_clip(probe)
+
+        clip = None
+        final_clip = None
+        try:
+            clip, resolved_path = _open_image_clip_with_fallback(image_path)
+            width, height = clip.size[0], clip.size[1]
+            if not is_material_resolution_acceptable(width, height):
+                logger.warning(
+                    f"low resolution generated image: {width}x{height}, minimum "
+                    f"{_MIN_MATERIAL_DIMENSION}x{_MIN_MATERIAL_DIMENSION} required "
+                    f"(tolerance {_MIN_DIMENSION_TOLERANCE}px)"
+                )
+                close_clip(clip)
+                clip = None
+                continue
+
+            close_clip(clip)
+            clip = (
+                ImageClip(resolved_path)
+                .with_duration(clip_duration)
+                .with_position("center")
+            )
+            # 与 preprocess_video 的图片分支保持一致的缓慢放大（Ken Burns）效果。
+            zoom_clip = clip.resized(
+                lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
+            )
+            final_clip = CompositeVideoClip([zoom_clip])
+            final_clip.write_videofile(video_file, fps=30, logger=None)
+            logger.success(f"image clip created: {video_file}")
+            video_files.append(video_file)
+        except Exception as e:
+            logger.error(f"failed to build clip from image {image_path}: {str(e)}")
+        finally:
+            if clip is not None:
+                close_clip(clip)
+            if final_clip is not None:
+                close_clip(final_clip)
+
+    return video_files

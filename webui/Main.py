@@ -40,8 +40,9 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
-from app.services import cache_manager, llm, video, voice, webui_task
+from app.services import cache_manager, image_gen, llm, video, voice, webui_task
 from app.services import elevenlabs_music as elevenlabs_music_service
+from app.services import lyria as lyria_service
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
@@ -949,6 +950,9 @@ def _apply_pending_task_restore():
     st.session_state["elevenlabs_music_prompt_input"] = (
         params.get("video_music_prompt") or ""
     )
+    st.session_state["lyria_music_prompt_input"] = (
+        params.get("video_music_prompt") or ""
+    )
 
     # 字幕设置。对旧任务中的越界数值做最小限幅，避免 Slider 无法初始化。
     st.session_state["subtitle_enabled_checkbox"] = bool(
@@ -1362,6 +1366,15 @@ def _render_generation_task_snapshot(task_id, task):
         ):
             st.warning(
                 tr("ElevenLabs BGM Fallback Warning").format(
+                    index=warning.get("video_index", "")
+                )
+            )
+        elif (
+            isinstance(warning, Mapping)
+            and warning.get("code") == "lyria_bgm_failed"
+        ):
+            st.warning(
+                tr("Lyria BGM Fallback Warning").format(
                     index=warning.get("video_index", "")
                 )
             )
@@ -2225,6 +2238,7 @@ def _render_video_settings(panel, params):
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
                 (tr("Local file"), "local"),
+                (tr("AI Image"), "ai"),
             ]
 
             saved_video_source_name = config.app.get("video_source", "pexels")
@@ -2384,7 +2398,286 @@ def _render_video_settings(panel, params):
                 config.app.pop("video_codec", None)
             else:
                 config.app["video_codec"] = selected_video_codec
+
+            # AI 图片素材源：准备（生成提示词+图片）与逐张审核/重试。放在 aspect
+            # 选择之后，确保 params.video_aspect 已确定。
+            if params.video_source == "ai":
+                _render_ai_image_source(params)
     return uploaded_files
+
+
+def _render_ai_image_source(params):
+    """AI 图片素材源（video_source = "ai"）的准备与审核界面。"""
+    st.caption(tr("AI Image Source Help"))
+
+    ai_providers = [
+        ("fal.ai", "fal"),
+        ("Replicate", "replicate"),
+        ("Google (Nano Banana Pro)", "gemini"),
+    ]
+    valid_providers = {value for _, value in ai_providers}
+    saved_provider = (config.app.get("image_provider") or "fal").strip().lower()
+    if saved_provider not in valid_providers:
+        saved_provider = "fal"
+    provider = stable_selectbox(
+        tr("AI Image Provider"),
+        options=[value for _, value in ai_providers],
+        default_value=saved_provider,
+        key="image_provider_select",
+        format_func=lambda value: dict(
+            (v, label) for label, v in ai_providers
+        )[value],
+    )
+    config.app["image_provider"] = provider
+
+    # API 凭据就地输入，方便快速上手；也可在配置文件里设置。
+    if provider == "fal":
+        config.app["fal_api_key"] = st.text_input(
+            tr("fal.ai API Key"),
+            value=config.app.get("fal_api_key", ""),
+            type="password",
+            key="fal_api_key_input",
+        ).strip()
+    elif provider == "gemini":
+        # 复用 LLM 侧已有的 gemini_api_key，用户配置一次即可两处生效。
+        config.app["gemini_api_key"] = st.text_input(
+            tr("Gemini API Key"),
+            value=config.app.get("gemini_api_key", ""),
+            type="password",
+            key="gemini_image_api_key_input",
+        ).strip()
+        # Nano Banana 家族的图片模型：Pro 画质最好，Flash / Flash Lite 更快更省。
+        # 这些都属于同一代（3.x）图片接口，画幅比例等参数行为一致。
+        gemini_image_models = [
+            ("Nano Banana Pro — Gemini 3 Pro Image", "gemini-3-pro-image"),
+            ("Nano Banana — Gemini 3.1 Flash Image", "gemini-3.1-flash-image"),
+            ("Nano Banana Lite — Gemini 3.1 Flash Lite Image", "gemini-3.1-flash-lite-image"),
+        ]
+        saved_model = (
+            config.app.get("gemini_image_model_name") or "gemini-3-pro-image"
+        ).strip()
+        # 保留用户在 config.toml 里手填的自定义模型，避免下拉框把它覆盖掉。
+        if saved_model not in {value for _, value in gemini_image_models}:
+            gemini_image_models = [(saved_model, saved_model)] + gemini_image_models
+        image_model_labels = dict(
+            (value, label) for label, value in gemini_image_models
+        )
+        config.app["gemini_image_model_name"] = stable_selectbox(
+            tr("AI Image Model"),
+            options=[value for _, value in gemini_image_models],
+            default_value=saved_model,
+            key="gemini_image_model_select",
+            format_func=lambda value: image_model_labels.get(value, value),
+        )
+    else:
+        config.app["replicate_api_token"] = st.text_input(
+            tr("Replicate API Token"),
+            value=config.app.get("replicate_api_token", ""),
+            type="password",
+            key="replicate_api_token_input",
+        ).strip()
+
+    try:
+        saved_max = int(config.app.get("image_gen_max_images", 40))
+    except (TypeError, ValueError):
+        saved_max = 40
+    saved_max = max(1, saved_max)
+
+    # 计数模式：自动（按脚本/旁白铺满，只设上限）或固定张数。
+    count_modes = [("auto", tr("Auto")), ("fixed", tr("Fixed"))]
+    mode = stable_selectbox(
+        tr("AI Image Count Mode"),
+        options=[value for value, _ in count_modes],
+        default_value="auto",
+        key="ai_image_count_mode",
+        format_func=lambda value: dict(count_modes)[value],
+    )
+
+    if mode == "auto":
+        # 用户只设上限；实际张数由脚本（审核预览）或旁白时长（直接生成）决定。
+        st.session_state.setdefault("ai_image_max_input", saved_max)
+        max_images = int(
+            st.number_input(
+                tr("AI Image Max Count"),
+                min_value=1,
+                max_value=200,
+                step=1,
+                key="ai_image_max_input",
+                help=tr("AI Image Max Count Help"),
+            )
+        )
+        config.app["image_gen_max_images"] = max_images
+        params.image_count = 0  # 0 触发后端自动模式
+    else:
+        st.session_state.setdefault("ai_image_count_input", min(5, saved_max))
+        params.image_count = int(
+            st.number_input(
+                tr("AI Image Count"),
+                min_value=1,
+                max_value=saved_max,
+                step=1,
+                key="ai_image_count_input",
+                help=tr("AI Image Count Help"),
+            )
+        )
+
+    if st.button(
+        tr("Prepare AI Images"),
+        key="prepare_ai_images_button",
+        use_container_width=True,
+        type="secondary",
+        icon=":material/auto_awesome:",
+    ):
+        _prepare_ai_images(params)
+
+    _render_ai_image_grid(params)
+
+
+def _estimate_ai_image_count(script):
+    """自动模式下按脚本句子数估算画面张数，并用 image_gen_max_images 兜底。
+
+    审核预览阶段还没有旁白音频，无法用时长推算张数（后端直接生成时才用时长），
+    因此这里以脚本的句子数作为“分镜数”的近似，至少 1 张、不超过配置上限。
+    """
+    try:
+        max_images = int(config.app.get("image_gen_max_images", 40))
+    except (TypeError, ValueError):
+        max_images = 40
+    max_images = max(1, max_images)
+
+    text = (script or "").strip()
+    if not text:
+        return 1
+    # 中英文断句符都算作句子边界，空白片段不计入。
+    sentences = [s for s in re.split(r"[.!?。！？\n]+", text) if s.strip()]
+    count = len(sentences) or 1
+    return max(1, min(count, max_images))
+
+
+def _prepare_ai_images(params):
+    """生成脚本（如缺失）、分镜提示词与图片，结果存入 session_state 供审核。"""
+    subject = (st.session_state.get("video_subject") or "").strip()
+    script = (st.session_state.get("video_script") or "").strip()
+    if not subject and not script:
+        st.warning(tr("Video Script and Subject Cannot Both Be Empty"))
+        return
+
+    provider = (config.app.get("image_provider") or "fal").strip().lower()
+    if provider == "fal" and not config.app.get("fal_api_key"):
+        st.warning(tr("Please Enter the fal.ai API Key"))
+        return
+    if provider == "replicate" and not config.app.get("replicate_api_token"):
+        st.warning(tr("Please Enter the Replicate API Token"))
+        return
+    if provider == "gemini" and not config.app.get("gemini_api_key"):
+        st.warning(tr("Please Enter the Gemini API Key"))
+        return
+
+    mode = st.session_state.get("ai_image_count_mode", "auto")
+    aspect = params.video_aspect
+
+    with st.spinner(tr("Preparing AI Images")):
+        with config.runtime_config_lock():
+            # 锁定脚本：优先使用用户脚本，否则生成一份并锁定，确保最终成片的
+            # 旁白与所审核的图片来自同一份脚本。
+            if not script:
+                script = llm.generate_script(
+                    video_subject=subject,
+                    language=params.video_language,
+                    paragraph_number=params.paragraph_number,
+                    video_script_prompt=params.video_script_prompt,
+                    custom_system_prompt=params.custom_system_prompt,
+                )
+            if not script or "Error: " in str(script):
+                st.error(tr("Video Generation Failed"))
+                return
+
+            # 固定模式用用户指定张数；自动模式此时还没有旁白时长，改按脚本的
+            # 句子数估算一个张数，并用上限兜底，让预览与成片大致一致。
+            if mode == "fixed":
+                count = int(st.session_state.get("ai_image_count_input", 5) or 5)
+            else:
+                count = _estimate_ai_image_count(script)
+
+            prompts = llm.generate_image_prompts(
+                video_subject=subject or script,
+                video_script=script,
+                amount=count,
+            )
+            if not prompts:
+                st.error(tr("Failed to Generate Image Prompts"))
+                return
+
+            try:
+                images = image_gen.prepare_images(prompts, aspect)
+            except image_gen.ImageGenConfigError as e:
+                st.error(str(e))
+                return
+
+    st.session_state["ai_prep_script"] = script
+    st.session_state["ai_prep_prompts"] = prompts
+    st.session_state["ai_prep_images"] = images
+
+
+def _retry_ai_image(params, index, new_prompt):
+    """按（可能被编辑的）提示词强制重生成单张图片并更新 session_state。"""
+    prompts = list(st.session_state.get("ai_prep_prompts") or [])
+    images = list(st.session_state.get("ai_prep_images") or [])
+    while len(images) < len(prompts):
+        images.append(None)
+
+    new_prompt = (new_prompt or "").strip()
+    if not new_prompt or index >= len(prompts):
+        return
+
+    prompts[index] = new_prompt
+    with st.spinner(tr("Retrying Image")):
+        with config.runtime_config_lock():
+            try:
+                images[index] = image_gen.regenerate_one(new_prompt, params.video_aspect)
+            except image_gen.ImageGenError as e:
+                images[index] = None
+                st.error(str(e))
+
+    st.session_state["ai_prep_prompts"] = prompts
+    st.session_state["ai_prep_images"] = images
+
+
+def _render_ai_image_grid(params):
+    prompts = st.session_state.get("ai_prep_prompts") or []
+    images = st.session_state.get("ai_prep_images") or []
+    if not prompts:
+        return
+
+    st.write(tr("AI Image Review"))
+    cols_per_row = 2
+    row = None
+    for i, prompt in enumerate(prompts):
+        if i % cols_per_row == 0:
+            row = st.columns(cols_per_row)
+        with row[i % cols_per_row]:
+            image_path = images[i] if i < len(images) else None
+            if image_path and os.path.exists(image_path):
+                st.image(image_path, use_container_width=True)
+            else:
+                st.warning(tr("Image Not Generated"))
+
+            with st.expander(tr("Edit Prompt"), expanded=False):
+                st.text_area(
+                    tr("Image Prompt"),
+                    value=prompt,
+                    key=f"ai_prompt_edit_{i}",
+                    height=80,
+                )
+            if st.button(
+                tr("Retry"),
+                key=f"ai_retry_{i}",
+                use_container_width=True,
+                icon=":material/refresh:",
+            ):
+                _retry_ai_image(
+                    params, i, st.session_state.get(f"ai_prompt_edit_{i}", prompt)
+                )
 
 
 def _estimate_voiceover_duration_range(
@@ -2813,6 +3106,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         (tr("Custom Background Music"), "custom"),
         (tr("Sonilo Background Music"), "sonilo"),
         (tr("ElevenLabs Background Music"), "elevenlabs"),
+        (tr("Lyria Background Music"), "lyria"),
     ]
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
@@ -2843,6 +3137,14 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
             st.caption(tr("ElevenLabs API Key Help"))
         else:
             _render_elevenlabs_api_key_input("ElevenLabs Music API Key")
+    elif params.bgm_type == "lyria":
+        # Lyria 复用 LLM / AI 图片侧的 gemini_api_key，配置一次多处生效。
+        config.app["gemini_api_key"] = st.text_input(
+            tr("Gemini API Key"),
+            value=config.app.get("gemini_api_key", ""),
+            type="password",
+            key="lyria_gemini_api_key_input",
+        ).strip()
 
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
@@ -3010,6 +3312,16 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
                 st.error(tr("ElevenLabs Connection Test Failed").format(error=str(exc)))
             else:
                 st.success(tr("ElevenLabs Connection Test Succeeded"))
+    elif params.bgm_type == "lyria":
+        # Lyria 是 text-to-music，提示词是主要创作输入（留空则用通用背景乐兜底）。
+        params.video_music_prompt = st.text_input(
+            tr("Lyria Music Prompt"),
+            key="lyria_music_prompt_input",
+            max_chars=lyria_service.MAX_PROMPT_LENGTH,
+            help=tr("Lyria Music Prompt Help"),
+        ).strip()
+        if params.video_count > 1:
+            st.warning(tr("Lyria Multiple Videos Warning"))
     if params.bgm_type == "sonilo" and bgm_enabled and not sonilo_service.is_enabled():
         # 音量为 0 时任务层不会生成或混合 Sonilo 配乐，因此无需提示 Key；
         # 该判断与任务入口共用服务层规则，避免界面提示和实际执行条件分叉。
@@ -3020,6 +3332,8 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         and not elevenlabs_music_service.is_enabled()
     ):
         st.warning(tr("ElevenLabs API Key Required"))
+    elif params.bgm_type == "lyria" and bgm_enabled and not lyria_service.is_enabled():
+        st.warning(tr("Lyria API Key Required"))
     return uploaded_bgm_file
 
 
@@ -3710,10 +4024,37 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "local"]:
+        if params.video_source not in ["pexels", "pixabay", "coverr", "local", "ai"]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
+
+        if params.video_source == "ai":
+            ai_provider = (config.app.get("image_provider") or "fal").strip().lower()
+            if ai_provider == "fal" and not config.app.get("fal_api_key"):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Enter the fal.ai API Key"))
+                st.stop()
+            if ai_provider == "replicate" and not config.app.get(
+                "replicate_api_token"
+            ):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Enter the Replicate API Token"))
+                st.stop()
+            if ai_provider == "gemini" and not config.app.get("gemini_api_key"):
+                _remove_active_generation_task(task_id)
+                st.error(tr("Please Enter the Gemini API Key"))
+                st.stop()
+
+            # 审核后的提示词（含用户编辑）优先传给任务，保证“审核所见即成片”。
+            # 未点击“准备”时留空，任务会按 image_count 自动生成提示词和图片。
+            prepared_prompts = st.session_state.get("ai_prep_prompts")
+            if prepared_prompts:
+                params.image_prompts = list(prepared_prompts)
+                # 锁定与审核图片一致的脚本：用户未手填脚本时用准备阶段生成的脚本。
+                prepared_script = st.session_state.get("ai_prep_script")
+                if not (params.video_script or "").strip() and prepared_script:
+                    params.video_script = prepared_script
 
         if params.video_source == "pexels" and not config.app.get(
             "pexels_api_keys", ""

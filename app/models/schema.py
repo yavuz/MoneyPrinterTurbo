@@ -87,6 +87,13 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    # AI 图片素材数量（video_source = "ai"）。0 表示按音频时长自动估算（默认，
+    # 与旧行为一致）；>0 表示固定张数，每张显示时长≈audio_duration/image_count，
+    # 适合 Shorts 这类需要精确控制画面数量的场景。
+    image_count: Optional[int] = 0
+    # 显式传入的分镜提示词（WebUI 审核后的最终提示词，或 API 调用方自带）。
+    # 非空时任务直接使用它们，跳过 LLM 重新生成，确保“审核所见即最终成片”。
+    image_prompts: Optional[List[str]] = None
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     video_language: Optional[str] = ""  # auto detect

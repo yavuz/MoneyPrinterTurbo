@@ -162,6 +162,47 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIsInstance(result, list)
 
+    def test_generate_music_prompt_builds_instrumental_prompt(self):
+        """text-to-music 配乐提示词必须约束为单行、纯器乐、无人声。"""
+        captured = {}
+
+        def fake_generate_response(prompt):
+            captured["prompt"] = prompt
+            return "upbeat lo-fi hip hop, mellow piano and soft drums, 90 BPM, relaxed"
+
+        with patch.object(
+            llm, "_generate_response", side_effect=fake_generate_response
+        ):
+            result = llm.generate_music_prompt(
+                video_subject="a calm morning routine",
+                video_script="Wake up. Stretch. Make coffee.",
+            )
+
+        self.assertEqual(
+            result, "upbeat lo-fi hip hop, mellow piano and soft drums, 90 BPM, relaxed"
+        )
+        self.assertIn("instrumental only", captured["prompt"])
+        self.assertIn("no vocals", captured["prompt"])
+
+    def test_generate_music_prompt_collapses_to_single_line(self):
+        """模型偶尔会带围栏或多行说明；只保留第一段非空行并压平空白。"""
+        response = '```\n"epic orchestral   score, soaring strings"\n(fits the theme)\n```'
+        with patch.object(llm, "_generate_response", return_value=response):
+            result = llm.generate_music_prompt("a hero's journey", "He rises.")
+        self.assertEqual(result, "epic orchestral score, soaring strings")
+
+    def test_generate_music_prompt_returns_empty_on_provider_error(self):
+        """配乐提示词是可选增强：Provider 错误或空输入必须回退为空字符串。"""
+        with patch.object(
+            llm, "_generate_response", return_value="Error: invalid API key"
+        ):
+            self.assertEqual(llm.generate_music_prompt("subject", "script"), "")
+
+        # 主题与脚本都为空时不应调用模型。
+        with patch.object(llm, "_generate_response") as gen:
+            self.assertEqual(llm.generate_music_prompt("  ", ""), "")
+            gen.assert_not_called()
+
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """
         API 请求模型需要限制高级 prompt 参数，避免外部调用绕过 WebUI
@@ -1536,6 +1577,33 @@ class TestLiteLLMLiveIntegration(unittest.TestCase):
 
         self.assertNotIn("Error:", result)
         self.assertIn("4", result)
+
+
+class TestGenerateImagePrompts(unittest.TestCase):
+    def test_parses_json_array_of_prompts(self):
+        response = '["a misty mountain at dawn", "coins on a wooden table"]'
+        with patch.object(llm, "_generate_response", return_value=response):
+            prompts = llm.generate_image_prompts("money", "a script", amount=2)
+        self.assertEqual(
+            prompts, ["a misty mountain at dawn", "coins on a wooden table"]
+        )
+
+    def test_truncates_when_model_returns_too_many(self):
+        response = '["p1", "p2", "p3", "p4"]'
+        with patch.object(llm, "_generate_response", return_value=response):
+            prompts = llm.generate_image_prompts("s", "script", amount=2)
+        self.assertEqual(prompts, ["p1", "p2"])
+
+    def test_pads_by_cycling_when_model_returns_too_few(self):
+        response = '["only one"]'
+        with patch.object(llm, "_generate_response", return_value=response):
+            prompts = llm.generate_image_prompts("s", "script", amount=3)
+        self.assertEqual(prompts, ["only one", "only one", "only one"])
+
+    def test_returns_empty_on_provider_error(self):
+        with patch.object(llm, "_generate_response", return_value="Error: boom"):
+            prompts = llm.generate_image_prompts("s", "script", amount=2)
+        self.assertEqual(prompts, [])
 
 
 if __name__ == "__main__":

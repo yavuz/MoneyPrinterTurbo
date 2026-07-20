@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -17,8 +18,11 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
+    image_gen,
     llm,
+    lyria,
     material,
+    music_cache,
     sonilo,
     subtitle,
     twelvelabs,
@@ -71,6 +75,20 @@ _VIDEO_MUSIC_PROVIDERS = {
         "suffix": ".mp3",
         "warning_code": "elevenlabs_bgm_failed",
         "display_name": "ElevenLabs",
+    },
+    "lyria": {
+        "service": lyria,
+        "error_type": lyria.LyriaError,
+        "suffix": ".mp3",
+        "warning_code": "lyria_bgm_failed",
+        "display_name": "Lyria",
+        # Lyria 是 text-to-music：不看视频，只按提示词作曲。用户留空提示词时，
+        # 由 LLM 依据主题/脚本自动生成一句配乐提示词（video-to-music 供应商则
+        # 直接分析画面，不需要该标记）。
+        "autoprompt": True,
+        # 输出只取决于提示词+模型+时长，与具体画面无关，因此可以按内容全局缓存
+        # 复用，失败重试时无需重复付费生成（video-to-music 供应商依赖画面，不设）。
+        "prompt_cacheable": True,
     },
 }
 
@@ -565,7 +583,125 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def _load_or_create_image_prompts(task_id, params, video_script, amount):
+    """加载或生成分镜文生图提示词，并持久化到任务目录。
+
+    断点续跑要求提示词在多次运行间保持稳定：LLM 每次生成的文案/提示词可能
+    不同，一旦提示词变了，``image_gen`` 的内容寻址缓存就会全部落空，无法从
+    断点继续。因此第一次运行把提示词写入 ``image_prompts.json``，之后（同一
+    ``task_id`` 重新运行）直接复用，保证缓存命中、只补齐缺失的图片。
+    """
+    prompts_file = path.join(utils.task_dir(task_id), "image_prompts.json")
+
+    # 1. 显式传入的提示词优先（WebUI 审核后的最终提示词 / API 调用方自带），
+    #    保证“审核所见即最终成片”，并持久化以支持断点续跑。
+    explicit = getattr(params, "image_prompts", None)
+    if explicit:
+        prompts = [p for p in explicit if isinstance(p, str) and p.strip()]
+        if prompts:
+            _persist_image_prompts(prompts_file, prompts)
+            return prompts
+
+    # 2. 已持久化的提示词（同一 task_id 重跑）：LLM 每次输出可能不同，复用可
+    #    保证 image_gen 的内容寻址缓存命中，只补齐缺失的图片。
+    if os.path.exists(prompts_file):
+        try:
+            with open(prompts_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            prompts = [p for p in saved if isinstance(p, str) and p.strip()]
+            if prompts:
+                logger.info(
+                    f"resuming with {len(prompts)} persisted image prompts"
+                )
+                return prompts
+        except Exception as e:
+            logger.warning(f"failed to read persisted image prompts: {str(e)}")
+
+    # 3. 首次运行：用 LLM 生成并持久化。
+    prompts = llm.generate_image_prompts(
+        video_subject=params.video_subject,
+        video_script=video_script,
+        amount=amount,
+    )
+    if not prompts:
+        return None
+
+    _persist_image_prompts(prompts_file, prompts)
+    return prompts
+
+
+def _persist_image_prompts(prompts_file, prompts):
+    try:
+        with open(prompts_file, "w", encoding="utf-8") as f:
+            f.write(utils.to_json(prompts))
+    except Exception as e:
+        # 写入失败不阻断本次生成，但会失去后续运行的断点稳定性。
+        logger.warning(f"failed to persist image prompts: {str(e)}")
+
+
+def _get_ai_image_materials(task_id, params, video_script, audio_duration):
+    try:
+        max_images = int(config.app.get("image_gen_max_images", 40))
+    except (TypeError, ValueError):
+        max_images = 40
+    max_images = max(1, max_images)
+
+    default_clip_duration = params.video_clip_duration or 5
+    image_count = int(params.image_count or 0)
+
+    if image_count > 0:
+        # 固定张数模式（Shorts）：用户明确指定画面数量，上限由 max_images 兜底。
+        amount = min(image_count, max_images)
+    else:
+        # 自动模式：按音频时长和单段时长估算，铺满旁白；上限避免失控成本。
+        amount = (
+            max(1, math.ceil(audio_duration / default_clip_duration))
+            if audio_duration
+            else 1
+        )
+        amount = min(amount, max_images)
+
+    prompts = _load_or_create_image_prompts(
+        task_id, params, video_script, amount
+    )
+    if not prompts:
+        _mark_task_failed(
+            task_id,
+            "materials",
+            "failed to generate image prompts for AI image source",
+        )
+        return None
+
+    try:
+        image_paths = image_gen.generate_images(
+            task_id=task_id,
+            image_prompts=prompts,
+            video_aspect=params.video_aspect,
+        )
+    except image_gen.ImageGenError as e:
+        # 部分图片失败时，成功的图片已缓存；这里失败但不清理缓存，
+        # 用相同 task_id 重新运行即可从断点继续。
+        _mark_task_failed(task_id, "materials", str(e))
+        return None
+
+    # 固定张数模式下，让 N 张图片均匀铺满旁白时长；自动模式沿用配置的单段时长。
+    if image_count > 0 and audio_duration and image_paths:
+        clip_duration = max(1, math.ceil(audio_duration / len(image_paths)))
+    else:
+        clip_duration = default_clip_duration
+
+    clips = video.create_image_clip_files(image_paths, clip_duration=clip_duration)
+    if not clips:
+        _mark_task_failed(
+            task_id,
+            "materials",
+            "failed to build video clips from generated images",
+        )
+        return None
+    return clips
+
+
+def get_video_materials(task_id, params, video_terms, audio_duration, video_script=""):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -579,6 +715,11 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+    elif params.video_source == "ai":
+        logger.info("\n\n## generating AI images for materials")
+        return _get_ai_image_materials(
+            task_id, params, video_script, audio_duration
+        )
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
@@ -608,7 +749,13 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    video_script="",
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -618,6 +765,32 @@ def generate_final_videos(
         video_music_provider is not None
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
+
+    # 配乐提示词只解析一次，供所有输出视频复用：既避免多视频时重复调用 LLM，
+    # 也保证同一次运行里每条视频使用同一段音乐风格。用户显式填写的提示词优先；
+    # 留空且供应商是 text-to-music（autoprompt）时，才用 LLM 依据主题/脚本自动
+    # 生成一句提示词，并按内容缓存该提示词——否则每次重试都会生成不同提示词，
+    # 让下面的音乐缓存键漂移、永远无法命中。
+    script_for_prompt = video_script or params.video_script
+    music_prompt = _get_video_music_prompt(params)
+    if (
+        video_music_requested
+        and not music_prompt
+        and video_music_provider.get("autoprompt")
+    ):
+        music_prompt = music_cache.resolve_auto_prompt(
+            provider=params.bgm_type,
+            subject=params.video_subject,
+            script=script_for_prompt,
+            generator=lambda: llm.generate_music_prompt(
+                video_subject=params.video_subject,
+                video_script=script_for_prompt,
+            ),
+        )
+        if music_prompt:
+            logger.info(
+                f"using music prompt for {params.bgm_type}: {music_prompt}"
+            )
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.match_materials_to_script:
@@ -663,14 +836,41 @@ def generate_final_videos(
                 utils.task_dir(task_id),
                 (f"{params.bgm_type}-bgm-{index}{video_music_provider['suffix']}"),
             )
+            # text-to-music 供应商的结果可全局缓存：相同 provider+模型+提示词+
+            # 时长直接复用已生成的音乐，失败重试时无需重复付费生成。
+            prompt_cacheable = video_music_provider.get("prompt_cacheable")
+            model_tag = (
+                getattr(service, "model_tag", lambda: "")() if prompt_cacheable else ""
+            )
             try:
-                service.generate_bgm(
-                    video_path=combined_video_path,
-                    output_path=generated_bgm_path,
-                    video_duration=audio_duration,
-                    prompt=_get_video_music_prompt(params),
+                cached_music = (
+                    music_cache.get_cached_music(
+                        params.bgm_type, model_tag, music_prompt, audio_duration
+                    )
+                    if prompt_cacheable
+                    else None
                 )
-                bgm_file_override = generated_bgm_path
+                if cached_music:
+                    logger.info(
+                        f"reusing cached {display_name} music: {cached_music}"
+                    )
+                    bgm_file_override = cached_music
+                else:
+                    service.generate_bgm(
+                        video_path=combined_video_path,
+                        output_path=generated_bgm_path,
+                        video_duration=audio_duration,
+                        prompt=music_prompt,
+                    )
+                    bgm_file_override = generated_bgm_path
+                    if prompt_cacheable:
+                        bgm_file_override = music_cache.store_music(
+                            generated_bgm_path,
+                            params.bgm_type,
+                            model_tag,
+                            music_prompt,
+                            audio_duration,
+                        )
             except video_music_provider["error_type"] as exc:
                 # 视频、旁白和字幕都已生成时，第三方配乐临时失败不应浪费整条
                 # 任务。当前视频明确禁用 BGM，并把降级结果返回 WebUI 提醒用户。
@@ -1110,7 +1310,9 @@ def _run_pipeline(
 
     # 2. Generate terms
     video_terms = ""
-    if params.video_source != "local":
+    # local 使用用户素材，ai 使用文生图提示词（在素材阶段单独生成），两者都不需要
+    # 库存视频检索关键词，跳过可以省下一次 LLM 调用。
+    if params.video_source not in ("local", "ai"):
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1172,7 +1374,7 @@ def _run_pipeline(
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id, params, video_terms, audio_duration, video_script=video_script
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1205,6 +1407,7 @@ def _run_pipeline(
         audio_file,
         subtitle_path,
         audio_duration,
+        video_script=video_script,
     )
 
     if not final_video_paths:

@@ -187,6 +187,181 @@ class TestTaskService(unittest.TestCase):
             )
         )
 
+    def test_generate_final_videos_lyria_uses_explicit_prompt(self):
+        """用户填写了 Lyria 提示词时直接使用，不触发自动生成。"""
+        params = VideoParams(
+            video_subject="test",
+            video_count=1,
+            bgm_type="lyria",
+            video_music_prompt="dreamy synthwave",
+        )
+
+        with (
+            patch.object(tm.video, "combine_videos"),
+            patch.object(
+                tm.lyria,
+                "generate_bgm",
+                side_effect=lambda **kwargs: kwargs["output_path"],
+            ) as generate_bgm,
+            patch.object(tm.llm, "generate_music_prompt") as auto_prompt,
+            patch.object(tm.music_cache, "get_cached_music", return_value=None),
+            patch.object(
+                tm.music_cache, "store_music", side_effect=lambda src, *a, **k: src
+            ),
+            patch.object(tm.video, "generate_video") as generate_video,
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            _, _, warnings = tm.generate_final_videos(
+                task_id="lyria-task",
+                params=params,
+                downloaded_videos=["material.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=5,
+                video_script="A dreamy night drive.",
+            )
+
+        self.assertEqual(warnings, [])
+        auto_prompt.assert_not_called()
+        self.assertEqual(generate_bgm.call_args.kwargs["prompt"], "dreamy synthwave")
+        self.assertTrue(
+            generate_video.call_args.kwargs["bgm_file_override"].endswith(
+                "lyria-bgm-1.mp3"
+            )
+        )
+
+    def test_generate_final_videos_lyria_auto_generates_prompt_when_empty(self):
+        """Lyria 提示词留空时，按主题/脚本自动生成一句并传给配乐服务。"""
+        params = VideoParams(
+            video_subject="a calm morning",
+            video_count=1,
+            bgm_type="lyria",
+            video_music_prompt="",
+        )
+
+        with (
+            patch.object(tm.video, "combine_videos"),
+            patch.object(
+                tm.lyria,
+                "generate_bgm",
+                side_effect=lambda **kwargs: kwargs["output_path"],
+            ) as generate_bgm,
+            patch.object(
+                tm.llm,
+                "generate_music_prompt",
+                return_value="soft ambient piano, slow tempo, peaceful",
+            ) as auto_prompt,
+            # 隔离全局缓存文件系统：只验证任务层把生成器接到 resolve_auto_prompt，
+            # resolve_auto_prompt 自身的缓存行为由 test_music_cache 覆盖。
+            patch.object(
+                tm.music_cache,
+                "resolve_auto_prompt",
+                side_effect=lambda provider, subject, script, generator: generator(),
+            ),
+            patch.object(tm.music_cache, "get_cached_music", return_value=None),
+            patch.object(
+                tm.music_cache, "store_music", side_effect=lambda src, *a, **k: src
+            ),
+            patch.object(tm.video, "generate_video") as generate_video,
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                task_id="lyria-auto-task",
+                params=params,
+                downloaded_videos=["material.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=5,
+                video_script="Wake up. Stretch. Make coffee.",
+            )
+
+        auto_prompt.assert_called_once()
+        self.assertEqual(
+            auto_prompt.call_args.kwargs["video_script"],
+            "Wake up. Stretch. Make coffee.",
+        )
+        self.assertEqual(
+            generate_bgm.call_args.kwargs["prompt"],
+            "soft ambient piano, slow tempo, peaceful",
+        )
+        self.assertTrue(
+            generate_video.call_args.kwargs["bgm_file_override"].endswith(
+                "lyria-bgm-1.mp3"
+            )
+        )
+
+    def test_generate_final_videos_lyria_reuses_cached_music(self):
+        """命中全局音乐缓存时不再调用（付费的）Lyria 生成，直接复用缓存文件。"""
+        params = VideoParams(
+            video_subject="test",
+            video_count=1,
+            bgm_type="lyria",
+            video_music_prompt="dreamy synthwave",
+        )
+
+        with (
+            patch.object(tm.video, "combine_videos"),
+            patch.object(tm.lyria, "generate_bgm") as generate_bgm,
+            patch.object(
+                tm.music_cache, "get_cached_music", return_value="/cache/hit.mp3"
+            ),
+            patch.object(tm.music_cache, "store_music") as store_music,
+            patch.object(tm.video, "generate_video") as generate_video,
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                task_id="lyria-hit",
+                params=params,
+                downloaded_videos=["material.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=5,
+            )
+
+        generate_bgm.assert_not_called()
+        store_music.assert_not_called()
+        self.assertEqual(
+            generate_video.call_args.kwargs["bgm_file_override"], "/cache/hit.mp3"
+        )
+
+    def test_generate_final_videos_lyria_stores_music_on_cache_miss(self):
+        """未命中缓存时生成一次并写入全局缓存，供后续重试复用。"""
+        params = VideoParams(
+            video_subject="test",
+            video_count=1,
+            bgm_type="lyria",
+            video_music_prompt="dreamy synthwave",
+        )
+
+        with (
+            patch.object(tm.video, "combine_videos"),
+            patch.object(
+                tm.lyria,
+                "generate_bgm",
+                side_effect=lambda **kwargs: kwargs["output_path"],
+            ) as generate_bgm,
+            patch.object(tm.music_cache, "get_cached_music", return_value=None),
+            patch.object(
+                tm.music_cache, "store_music", return_value="/cache/stored.mp3"
+            ) as store_music,
+            patch.object(tm.video, "generate_video") as generate_video,
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                task_id="lyria-miss",
+                params=params,
+                downloaded_videos=["material.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=5,
+            )
+
+        generate_bgm.assert_called_once()
+        store_music.assert_called_once()
+        self.assertEqual(
+            generate_video.call_args.kwargs["bgm_file_override"], "/cache/stored.mp3"
+        )
+
     def test_generate_final_videos_falls_back_on_elevenlabs_failure(self):
         """ElevenLabs 暂时失败时必须保留无配乐视频和结构化警告。"""
         params = VideoParams(video_subject="test", bgm_type="elevenlabs")
@@ -1583,7 +1758,134 @@ class TestTaskService(unittest.TestCase):
         )
         result = tm.start(task_id=task_id, params=params)
         print(result)
-    
+
+
+class TestAiImageMaterials(unittest.TestCase):
+    """video_source = "ai" 的素材分支与断点续跑（提示词持久化）测试。"""
+
+    def _params(self):
+        return VideoParams(
+            video_subject="the power of money",
+            video_source="ai",
+            video_aspect="9:16",
+            video_clip_duration=5,
+        )
+
+    def test_ai_branch_generates_prompts_images_and_clips(self):
+        params = self._params()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tm.utils, "task_dir", return_value=tmp), \
+                 patch.object(
+                     tm.llm, "generate_image_prompts", return_value=["p1", "p2"]
+                 ) as gen_prompts, \
+                 patch.object(
+                     tm.image_gen,
+                     "generate_images",
+                     return_value=["/i1.png", "/i2.png"],
+                 ) as gen_images, \
+                 patch.object(
+                     tm.video,
+                     "create_image_clip_files",
+                     return_value=["/c1.mp4", "/c2.mp4"],
+                 ) as make_clips:
+                result = tm.get_video_materials(
+                    "tid-ai", params, "", audio_duration=10, video_script="a script"
+                )
+
+        self.assertEqual(result, ["/c1.mp4", "/c2.mp4"])
+        # audio_duration/clip_duration = 10/5 = 2 张图片
+        self.assertEqual(gen_prompts.call_args.kwargs["amount"], 2)
+        gen_images.assert_called_once()
+        make_clips.assert_called_once()
+
+    def test_image_prompts_are_persisted_and_reused_for_resume(self):
+        params = self._params()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tm.utils, "task_dir", return_value=tmp):
+                with patch.object(
+                    tm.llm, "generate_image_prompts", return_value=["a", "b"]
+                ) as gen_prompts:
+                    first = tm._load_or_create_image_prompts(
+                        "tid-resume", params, "script", amount=2
+                    )
+                self.assertEqual(first, ["a", "b"])
+                self.assertTrue(
+                    os.path.exists(os.path.join(tmp, "image_prompts.json"))
+                )
+                self.assertEqual(gen_prompts.call_count, 1)
+
+                # 第二次运行：应复用持久化的提示词，不再调用 LLM。
+                with patch.object(
+                    tm.llm, "generate_image_prompts", return_value=["x", "y"]
+                ) as gen_prompts_2:
+                    second = tm._load_or_create_image_prompts(
+                        "tid-resume", params, "script", amount=2
+                    )
+                self.assertEqual(second, ["a", "b"])
+                gen_prompts_2.assert_not_called()
+
+    def test_fixed_image_count_sets_even_clip_duration(self):
+        params = self._params()
+        params.image_count = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tm.utils, "task_dir", return_value=tmp), \
+                 patch.object(
+                     tm.llm, "generate_image_prompts", return_value=["a", "b", "c"]
+                 ), \
+                 patch.object(
+                     tm.image_gen,
+                     "generate_images",
+                     return_value=["/1.png", "/2.png", "/3.png"],
+                 ), \
+                 patch.object(
+                     tm.video,
+                     "create_image_clip_files",
+                     return_value=["/1.mp4", "/2.mp4", "/3.mp4"],
+                 ) as make_clips:
+                tm.get_video_materials(
+                    "tid-fixed", params, "", audio_duration=30, video_script="s"
+                )
+        # 固定 3 张 + 30s 旁白 → 每张 ceil(30/3)=10s
+        self.assertEqual(make_clips.call_args.kwargs["clip_duration"], 10)
+
+    def test_explicit_image_prompts_take_priority_over_llm(self):
+        params = self._params()
+        params.image_prompts = ["custom a", "custom b"]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tm.utils, "task_dir", return_value=tmp):
+                with patch.object(tm.llm, "generate_image_prompts") as gen:
+                    prompts = tm._load_or_create_image_prompts(
+                        "tid-explicit", params, "script", amount=5
+                    )
+                self.assertEqual(prompts, ["custom a", "custom b"])
+                gen.assert_not_called()
+                # 显式提示词也会被持久化，支持后续断点续跑。
+                self.assertTrue(
+                    os.path.exists(os.path.join(tmp, "image_prompts.json"))
+                )
+
+    def test_ai_branch_failure_preserves_error_and_returns_none(self):
+        params = self._params()
+        tm.sm.state.update_task("tid-fail")
+        resume_msg = "failed to generate 1 image(s); re-run to resume"
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tm.utils, "task_dir", return_value=tmp), \
+                 patch.object(
+                     tm.llm, "generate_image_prompts", return_value=["p1"]
+                 ), \
+                 patch.object(
+                     tm.image_gen,
+                     "generate_images",
+                     side_effect=tm.image_gen.ImageGenError(resume_msg),
+                 ):
+                result = tm.get_video_materials(
+                    "tid-fail", params, "", audio_duration=5, video_script="s"
+                )
+
+        self.assertIsNone(result)
+        task = tm.sm.state.get_task("tid-fail")
+        self.assertEqual(task.get("error"), resume_msg)
+
 
 if __name__ == "__main__":
     unittest.main()
