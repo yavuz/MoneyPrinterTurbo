@@ -85,6 +85,7 @@ class TestTaskService(unittest.TestCase):
             paragraph_number=2,
             video_script_prompt="语气轻松",
             custom_system_prompt="Only write short narration.",
+            hook_style="",
         )
 
     def test_generate_final_videos_forwards_clip_speed(self):

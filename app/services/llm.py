@@ -456,12 +456,39 @@ def _normalize_script_paragraph_number(paragraph_number: int | None) -> int:
     return value
 
 
+# 短视频“前3秒钩子”：把第一句写成能立刻抓住注意力的开场，避免平淡开头。
+# 空字符串表示不加钩子（保持默认行为）。
+HOOK_STYLES = ("auto", "question", "bold_claim", "curiosity", "statistic")
+
+_HOOK_STYLE_HINTS = {
+    "auto": "lead with the single most surprising or valuable point",
+    "question": "open with a provocative question the viewer needs answered",
+    "bold_claim": "open with a bold, counterintuitive claim",
+    "curiosity": "open with a curiosity gap that makes them keep watching",
+    "statistic": "open with a striking statistic or concrete fact",
+}
+
+
+def _hook_instruction(hook_style: str) -> str:
+    """按所选钩子风格返回一句“前3秒开场”指令；未知/空风格返回空串。"""
+    hint = _HOOK_STYLE_HINTS.get((hook_style or "").strip().lower())
+    if not hint:
+        return ""
+    return (
+        "The first sentence must be a scroll-stopping hook that grabs attention "
+        f"within the first 3 seconds: {hint}. Do not use generic or "
+        "throat-clearing openers; deliver the hook immediately in the video's "
+        "language."
+    )
+
+
 def build_script_prompt(
     video_subject: str,
     language: str = "",
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    hook_style: str = "",
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -482,6 +509,13 @@ def build_script_prompt(
 """.rstrip()
     if language:
         prompt += f"\n- language: {language}"
+    hook_instruction = _hook_instruction(hook_style)
+    if hook_instruction:
+        prompt += f"""
+
+# Hook (first 3 seconds):
+{hook_instruction}
+""".rstrip()
     if video_script_prompt:
         prompt += f"""
 
@@ -498,6 +532,7 @@ def generate_script(
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    hook_style: str = "",
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -512,6 +547,7 @@ def generate_script(
         paragraph_number=paragraph_number,
         video_script_prompt=video_script_prompt,
         custom_system_prompt=custom_system_prompt,
+        hook_style=hook_style,
     )
     final_script = ""
     logger.info(

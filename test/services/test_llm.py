@@ -77,6 +77,25 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("# Additional User Requirements:", prompt)
         self.assertIn("语气轻松，面向程序员", prompt)
 
+    def test_build_script_prompt_injects_hook_when_style_set(self):
+        """选择钩子风格时，提示词必须带上“前3秒开场”指令。"""
+        prompt = llm.build_script_prompt(
+            video_subject="AI news",
+            hook_style="question",
+        )
+        self.assertIn("# Hook (first 3 seconds):", prompt)
+        self.assertIn("first 3 seconds", prompt)
+        self.assertIn("provocative question", prompt)
+
+    def test_build_script_prompt_omits_hook_when_off_or_unknown(self):
+        """默认（空）或非法风格都不应注入钩子指令，保持原有行为。"""
+        for style in ("", "none", "nonsense"):
+            with self.subTest(style=style):
+                prompt = llm.build_script_prompt(
+                    video_subject="AI news", hook_style=style
+                )
+                self.assertNotIn("# Hook (first 3 seconds):", prompt)
+
     def test_custom_system_prompt_keeps_runtime_context(self):
         """
         自定义 system prompt 会替换默认脚本规则，但视频主题、语言、段落数

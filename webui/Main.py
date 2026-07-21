@@ -891,6 +891,9 @@ def _apply_pending_task_restore():
         "script_language_select", params.get("video_language") or ""
     )
     st.session_state["paragraph_number_input"] = params.get("paragraph_number", 1)
+    _set_stable_widget_value(
+        "video_hook_style_select", params.get("video_hook_style") or ""
+    )
     st.session_state["video_script_prompt"] = params.get("video_script_prompt") or ""
     st.session_state["custom_system_prompt"] = (
         params.get("custom_system_prompt") or llm.DEFAULT_SCRIPT_SYSTEM_PROMPT
@@ -1321,6 +1324,103 @@ def _render_generation_logs(task_id):
     st.code("\n".join(log_records))
 
 
+# 发布分发目标：用户手动上传时最常用的三个短视频平台。value 对应
+# llm.generate_social_metadata 的 platform 参数。
+_SOCIAL_KIT_PLATFORMS = [
+    ("TikTok", "tiktok"),
+    ("Instagram", "instagram_reels"),
+    ("YouTube Shorts", "youtube_shorts"),
+]
+
+
+def _render_publishing_kit(task_id, task, video_files):
+    """成片完成后提供“发布物料”：可编辑的标题/描述/标签与视频下载。
+
+    不接入任何第三方发布服务——按用户选择，只准备好每个平台的文案（LLM 生成、
+    可编辑）和成片文件，用户自行上传。Docker 里任务目录开在容器内，宿主拿不到
+    文件，因此这里的下载按钮尤为重要。
+    """
+    with st.expander(tr("Publishing Kit"), expanded=False):
+        st.caption(tr("Publishing Kit Help"))
+
+        for index, video_path in enumerate(video_files):
+            try:
+                with open(video_path, "rb") as video_file:
+                    video_bytes = video_file.read()
+            except OSError:
+                continue
+            suffix = f" #{index + 1}" if len(video_files) > 1 else ""
+            st.download_button(
+                tr("Download Video") + suffix,
+                data=video_bytes,
+                file_name=os.path.basename(video_path),
+                mime="video/mp4",
+                key=f"pk_dl_{task_id}_{index}",
+                use_container_width=True,
+            )
+
+        ready_key = f"pk_ready_{task_id}"
+        already = st.session_state.get(ready_key)
+        button_label = (
+            tr("Regenerate Social Captions") if already else tr("Generate Social Captions")
+        )
+        if st.button(
+            button_label,
+            key=f"pk_gen_{task_id}",
+            use_container_width=True,
+            icon=":material/auto_awesome:",
+        ):
+            subject = (st.session_state.get("video_subject") or "").strip()
+            script = str(task.get("script") or "").strip()
+            if not subject:
+                # 旧任务快照不保存主题，用脚本首句兜底，保证文案生成有输入。
+                subject = script[:100]
+            if not subject and not script:
+                st.warning(tr("Publishing Kit Needs Content"))
+            else:
+                with st.spinner(tr("Generating Social Captions")):
+                    for _label, platform in _SOCIAL_KIT_PLATFORMS:
+                        meta = llm.generate_social_metadata(
+                            video_subject=subject,
+                            video_script=script,
+                            language="",
+                            platform=platform,
+                        )
+                        # 直接写入各控件的 session_state 键，让下方可编辑字段带上
+                        # 生成结果；重新生成时覆盖旧值。
+                        st.session_state[f"pk_title_{task_id}_{platform}"] = meta.get(
+                            "title", ""
+                        )
+                        st.session_state[f"pk_caption_{task_id}_{platform}"] = meta.get(
+                            "caption", ""
+                        )
+                        st.session_state[f"pk_tags_{task_id}_{platform}"] = " ".join(
+                            meta.get("hashtags", [])
+                        )
+                st.session_state[ready_key] = True
+
+        if not st.session_state.get(ready_key):
+            st.info(tr("Click Generate to Prepare Captions"))
+            return
+
+        tabs = st.tabs([label for label, _ in _SOCIAL_KIT_PLATFORMS])
+        for tab, (_label, platform) in zip(tabs, _SOCIAL_KIT_PLATFORMS):
+            with tab:
+                title = st.text_input(tr("Title"), key=f"pk_title_{task_id}_{platform}")
+                caption = st.text_area(
+                    tr("Description"),
+                    key=f"pk_caption_{task_id}_{platform}",
+                    height=140,
+                )
+                tags = st.text_input(tr("Hashtags"), key=f"pk_tags_{task_id}_{platform}")
+                combined = "\n\n".join(
+                    part.strip() for part in (title, caption, tags) if part.strip()
+                )
+                if combined:
+                    st.caption(tr("Copy Ready Text"))
+                    st.code(combined, language=None)
+
+
 def _render_generation_task_snapshot(task_id, task):
     """根据状态存储中的快照渲染进度、失败原因或最终成片。"""
     if not task:
@@ -1391,6 +1491,7 @@ def _render_generation_task_snapshot(task_id, task):
             f"video_files={video_files}, error={exc}"
         )
 
+    _render_publishing_kit(task_id, task, video_files)
     _render_generation_logs(task_id)
     if st.session_state.get("opened_generation_task_id") != task_id:
         # 原同步流程会在生成完成后自动打开任务目录。Fragment 可能重复运行，
@@ -2104,6 +2205,24 @@ def _render_script_settings(panel, params):
                         max_value=llm.MAX_SCRIPT_PARAGRAPH_NUMBER,
                         key="paragraph_number_input",
                     )
+                    # 前3秒钩子：让脚本第一句成为抓住注意力的开场。""=关闭。
+                    hook_options = [
+                        ("", tr("Hook Off")),
+                        ("auto", tr("Hook Auto")),
+                        ("question", tr("Hook Question")),
+                        ("bold_claim", tr("Hook Bold Claim")),
+                        ("curiosity", tr("Hook Curiosity")),
+                        ("statistic", tr("Hook Statistic")),
+                    ]
+                    hook_labels = dict(hook_options)
+                    params.video_hook_style = stable_selectbox(
+                        tr("Hook Style"),
+                        options=[value for value, _ in hook_options],
+                        default_value=(getattr(params, "video_hook_style", "") or ""),
+                        key="video_hook_style_select",
+                        format_func=lambda value: hook_labels.get(value, value),
+                        help=tr("Hook Style Help"),
+                    )
                     params.video_script_prompt = st.text_area(
                         tr("Custom Script Requirements"),
                         height=100,
@@ -2148,6 +2267,7 @@ def _render_script_settings(panel, params):
                                 paragraph_number=params.paragraph_number,
                                 video_script_prompt=params.video_script_prompt,
                                 custom_system_prompt=params.custom_system_prompt,
+                                hook_style=params.video_hook_style,
                             )
                         )
 
@@ -2171,6 +2291,7 @@ def _render_script_settings(panel, params):
                                 paragraph_number=params.paragraph_number,
                                 video_script_prompt=params.video_script_prompt,
                                 custom_system_prompt=params.custom_system_prompt,
+                                hook_style=params.video_hook_style,
                             )
                             terms = llm.generate_terms(
                                 params.video_subject,
@@ -2587,6 +2708,7 @@ def _prepare_ai_images(params):
                     paragraph_number=params.paragraph_number,
                     video_script_prompt=params.video_script_prompt,
                     custom_system_prompt=params.custom_system_prompt,
+                    hook_style=params.video_hook_style,
                 )
             if not script or "Error: " in str(script):
                 st.error(tr("Video Generation Failed"))
