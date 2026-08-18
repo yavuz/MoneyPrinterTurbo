@@ -29,6 +29,7 @@ class LLMProviderSpec:
     default_label: str
     adapter: str = "openai_compatible"
     api_key_url: str = ""
+    international_api_key_url: str = ""
     default_model: str = ""
     default_base_url: str = ""
     requires_api_key: bool = True
@@ -75,8 +76,17 @@ LLM_PROVIDER_REGISTRY = (
     LLMProviderSpec(
         "moonshot",
         "Kimi / Moonshot AI",
-        api_key_url="https://platform.kimi.com/console/api-keys?aff=MoneyPrinterTurbo",
-        default_model="kimi-k2.7-code",
+        api_key_url=(
+            "https://platform.kimi.com?"
+            "track_id=track-2f5441d6ffd84c509dd079d78e9db5dc&"
+            "aff=moneyprinterturbo"
+        ),
+        international_api_key_url=(
+            "https://platform.kimi.ai?"
+            "track_id=track-f6b0a640d35c41deb03b247242a1058c&"
+            "aff=moneyprinterturbo"
+        ),
+        default_model="kimi-k3",
         default_base_url="https://api.moonshot.cn/v1",
     ),
     # 主流模型原厂与云厂商
@@ -158,6 +168,13 @@ LLM_PROVIDER_REGISTRY = (
         default_base_url="https://api.xiaomimimo.com/v1",
     ),
     # 聚合与统一接入平台
+    LLMProviderSpec(
+        "shengsuanyun",
+        "Shengsuan Cloud",
+        api_key_url="https://www.shengsuanyun.com/?from=CH_XUQ4OTSK",
+        default_model="deepseek/deepseek-v4-flash",
+        default_base_url="https://router.shengsuanyun.com/api/v1",
+    ),
     LLMProviderSpec(
         "cloudflare",
         "Cloudflare AI Gateway",

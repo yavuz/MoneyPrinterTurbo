@@ -1,7 +1,6 @@
 import os
 import uuid
 import streamlit as st
-from loguru import logger
 
 from app.models.schema import VideoAspect, VideoParams
 from app.services import webui_task, voice
@@ -64,7 +63,6 @@ def render_channel_hub(tr_func=None):
 
     # Fetch all channels
     channels = channel_manager.get_all_channels()
-    available_songs = get_available_bgm_songs()
 
     # Layout tabs: 1. Kanal Listesi & Düzenleme, 2. Trend & Senaryo Stüdyosu
     tab_studio, tab_channels = st.tabs([
@@ -300,7 +298,7 @@ def render_channel_hub(tr_func=None):
                         key="new_ai_model_select"
                     )
                 with ai_col2:
-                    new_gemini_key = st.text_input(
+                    st.text_input(
                         "Google Gemini API Anahtarı",
                         value="",
                         type="password",
@@ -503,7 +501,7 @@ def render_channel_hub(tr_func=None):
                                     key=f"edit_ai_model_select_{ch.id}"
                                 )
                             with e_ai_col2:
-                                edit_gemini_key = st.text_input(
+                                st.text_input(
                                     "Google Gemini API Anahtarı",
                                     value="",
                                     type="password",

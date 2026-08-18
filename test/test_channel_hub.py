@@ -4,7 +4,6 @@ import tempfile
 import unittest
 
 from app.services.channel_manager import ChannelManager, ChannelProfile
-from app.services import trend_service
 
 
 class TestChannelHub(unittest.TestCase):
