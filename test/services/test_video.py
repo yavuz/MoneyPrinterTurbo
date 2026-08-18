@@ -153,6 +153,128 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(bgm_source.close_calls, 1)
         self.assertEqual(final_video.close_calls, 1)
 
+    def _run_generate_video_with_karaoke(self, temp_dir, burn_succeeds):
+        """跑一次开启逐词高亮的合成，返回 (写入调用, 烧录调用, 输出路径)。"""
+        subtitle_path = os.path.join(temp_dir, "subtitle.srt")
+        Path(subtitle_path).write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nhello world\n\n", encoding="utf-8"
+        )
+        output_file = os.path.join(temp_dir, "final.mp4")
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            word_level_subtitle=True,
+            bgm_type="",
+        )
+        source_video = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        final_video = _FakeMoviePyClip()
+        source_video.with_audio_result = final_video
+
+        def fake_write(clip, output_file, codec, **kwargs):
+            # 真实写入由 MoviePy 完成，这里只落一个占位文件供后续改名/删除。
+            Path(output_file).write_bytes(b"rendered")
+
+        with (
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+            patch.object(vd, "AudioFileClip", return_value=voice_source),
+            patch.object(vd.ass_service, "is_supported", return_value=True),
+            patch.object(
+                vd,
+                "_write_videofile_with_codec_fallback",
+                side_effect=fake_write,
+            ) as writer,
+            patch.object(
+                vd, "_burn_karaoke_subtitles", return_value=burn_succeeds
+            ) as burner,
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+        ):
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path=subtitle_path,
+                output_file=output_file,
+                params=params,
+            )
+
+        self.assertTrue(result)
+        return writer, burner, output_file
+
+    def test_generate_video_renders_without_subtitles_before_burning_them(self):
+        """
+        逐词高亮时 MoviePy 只写无字幕中间文件，字幕交给 libass 烧录。
+
+        这是该功能的性能前提：字幕不再逐条进入 CompositeVideoClip。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer, burner, output_file = self._run_generate_video_with_karaoke(
+                temp_dir, burn_succeeds=True
+            )
+
+        rendered = writer.call_args.kwargs["output_file"]
+        self.assertTrue(rendered.endswith(".nosub.mp4"))
+        self.assertEqual(rendered, burner.call_args.kwargs["rendered_video"])
+        self.assertEqual(output_file, burner.call_args.kwargs["output_file"])
+        # 烧录成功后中间文件必须清理掉，避免任务目录里留下一份无字幕成片。
+        self.assertFalse(os.path.exists(rendered))
+
+    def test_generate_video_keeps_the_unsubtitled_render_when_burning_fails(self):
+        """烧录失败只该丢字幕，不该丢整段视频。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer, _, output_file = self._run_generate_video_with_karaoke(
+                temp_dir, burn_succeeds=False
+            )
+
+            rendered = writer.call_args.kwargs["output_file"]
+            self.assertFalse(os.path.exists(rendered))
+            self.assertTrue(os.path.exists(output_file))
+
+    def test_generate_video_falls_back_to_line_subtitles_without_libass(self):
+        """缺少 libass 时必须走回 MoviePy 逐句字幕，而不是输出无字幕视频。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subtitle_path = os.path.join(temp_dir, "subtitle.srt")
+            Path(subtitle_path).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nhello world\n\n", encoding="utf-8"
+            )
+            output_file = os.path.join(temp_dir, "final.mp4")
+            params = vd.VideoParams(
+                video_subject="test",
+                subtitle_enabled=True,
+                word_level_subtitle=True,
+                bgm_type="",
+            )
+            source_video = _FakeMoviePyClip()
+            voice_source = _FakeMoviePyClip()
+            composited = _FakeMoviePyClip()
+            composited.with_audio_result = _FakeMoviePyClip()
+
+            with (
+                patch.object(
+                    vd, "_open_video_clip_quietly", return_value=source_video
+                ),
+                patch.object(vd, "AudioFileClip", return_value=voice_source),
+                patch.object(vd.ass_service, "is_supported", return_value=False),
+                patch.object(vd, "SubtitlesClip") as subtitles_clip,
+                patch.object(vd, "CompositeVideoClip", return_value=composited),
+                patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+                patch.object(vd, "_burn_karaoke_subtitles") as burner,
+                patch.object(
+                    vd, "_get_configured_video_codec", return_value="libx264"
+                ),
+            ):
+                subtitles_clip.return_value.subtitles = []
+                vd.generate_video(
+                    video_path="combined.mp4",
+                    audio_path="voice.mp3",
+                    subtitle_path=subtitle_path,
+                    output_file=output_file,
+                    params=params,
+                )
+
+        burner.assert_not_called()
+        subtitles_clip.assert_called_once()
+        self.assertEqual(output_file, writer.call_args.kwargs["output_file"])
+
     def test_generate_video_keeps_output_and_reports_failed_bgm_mix(self):
         """BGM 打开失败时仍应只写一次无 BGM 视频，并返回 False。"""
         params = vd.VideoParams(

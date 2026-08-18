@@ -291,6 +291,10 @@ max_queued_tasks = 100
 # Cross-platform Publishing / 跨平台发布
 # -----------------------------------------------------------------------------
 
+# Which service publishes finished videos: "upload_post" or "postiz".
+# Both share the same queue, task states and interrupted-job recovery.
+cross_post_provider = "upload_post"
+
 # Upload-Post can publish generated videos to TikTok, Instagram, and YouTube.
 # Create an account and API key at https://upload-post.com/
 # API documentation: https://docs.upload-post.com/
@@ -308,6 +312,41 @@ upload_post_youtube_privacy_status = "public"
 # rejected.
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
+
+# Postiz (https://github.com/gitroomhq/postiz-app) is an open-source, self-
+# hostable scheduler. Connect each social account once in the Postiz UI, then
+# this project only has to hand videos over — no per-platform OAuth here.
+# Requires cross_post_provider = "postiz".
+postiz_enabled = false
+# Settings -> Developers -> Public API in your Postiz instance.
+postiz_api_key = ""
+# Cloud: "https://api.postiz.com/public/v1"
+# Self-hosted: "https://<your-backend-domain>/public/v1"
+postiz_api_base = "https://api.postiz.com/public/v1"
+# Channels to publish to. Each entry is either a platform identifier
+# ("tiktok", "instagram", "youtube", "x", "linkedin", ...) or a specific
+# channel id from Postiz. A platform identifier fans out to every connected
+# account on that platform.
+postiz_channels = ["tiktok", "instagram"]
+# "draft"    -> lands in Postiz for you to review and publish manually
+# "schedule" -> queued in Postiz at now + postiz_schedule_delay_minutes
+# "now"      -> published immediately
+postiz_post_type = "draft"
+postiz_schedule_delay_minutes = 10
+# Automatically hand successful video outputs to Postiz after generation.
+postiz_auto_upload = false
+# Per-platform required fields, keyed by platform identifier. These differ per
+# platform and change with platform policy, so they are not hardcoded. Generate
+# them with the Postiz wizard: https://platform.postiz.com/modal/dark/all
+# Example:
+# [app.postiz_channel_settings.tiktok]
+# privacy_level = "PUBLIC_TO_EVERYONE"
+# content_posting_method = "DIRECT_POST"
+#
+# Two limits worth knowing before you rely on this:
+#   - the Postiz upload endpoint rejects files larger than 50 MB;
+#   - TikTok/Instagram/YouTube fetch the media over the public internet, so a
+#     self-hosted Postiz must serve uploads from a public HTTPS domain.
 
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
@@ -387,3 +426,7 @@ hide_log = false
 # subtitle_background_enabled = false
 # subtitle_background_color = "#000000"
 # rounded_subtitle_background = false
+# 逐词高亮字幕：整句常驻，当前朗读到的词带高亮色块。开启后字幕由 FFmpeg/libass
+# 烧录，上面的 subtitle_background_* 选项不再生效；需要 FFmpeg 编译时带 libass。
+# word_level_subtitle = false
+# subtitle_highlight_color = "#E11D2E"

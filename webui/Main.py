@@ -39,10 +39,13 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import ass
 from app.services import bgm as bgm_service
 from app.services import cache_manager, image_gen, llm, video, voice, webui_task
+from app.services.channel_manager import ChannelProfile, channel_manager
 from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import lyria as lyria_service
+from app.services import postiz
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
@@ -103,6 +106,8 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_enabled": False,
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
+    "word_level_subtitle": False,
+    "subtitle_highlight_color": "#E11D2E",
 }
 LOCAL_MATERIAL_EXTENSIONS = {
     ".mp4",
@@ -983,6 +988,12 @@ def _apply_pending_task_restore():
     st.session_state["rounded_subtitle_background_checkbox"] = bool(
         params.get("rounded_subtitle_background", False) and background_enabled
     )
+    st.session_state["word_level_subtitle_checkbox"] = bool(
+        params.get("word_level_subtitle", False)
+    )
+    st.session_state["subtitle_highlight_color_picker"] = (
+        params.get("subtitle_highlight_color") or "#E11D2E"
+    )
 
     st.session_state.pop("local_video_materials_uploader", None)
     # 历史任务只保存素材路径，不能保证这些文件在当前环境仍然存在。
@@ -1333,6 +1344,68 @@ _SOCIAL_KIT_PLATFORMS = [
 ]
 
 
+def _postiz_caption(task_id, task, platform):
+    """拼出某个平台的文案，未生成文案时回退到主题或脚本首句。"""
+    parts = [
+        st.session_state.get(f"pk_title_{task_id}_{platform}") or "",
+        st.session_state.get(f"pk_caption_{task_id}_{platform}") or "",
+        st.session_state.get(f"pk_tags_{task_id}_{platform}") or "",
+    ]
+    combined = "\n\n".join(part.strip() for part in parts if part.strip())
+    if combined:
+        return combined
+    subject = (st.session_state.get("video_subject") or "").strip()
+    return subject or str(task.get("script") or "").strip()[:100]
+
+
+def _render_postiz_publish(task_id, task, video_files):
+    """
+    把成片交给 Postiz 发布。
+
+    只在 Postiz 已配置时出现。默认按 `postiz_post_type` 走草稿，成片先落到
+    Postiz 待办里，由用户在 Postiz 界面做最后确认，符合“满意了再发”的用法。
+    """
+    service = postiz.get_service()
+    if not service.is_configured():
+        return
+
+    st.caption(tr("Send To Postiz Help"))
+    if not st.button(
+        tr("Send To Postiz"),
+        key=f"pk_postiz_{task_id}",
+        use_container_width=True,
+        icon=":material/send:",
+    ):
+        return
+
+    youtube_caption = _postiz_caption(task_id, task, "youtube_shorts")
+    youtube_extra = {
+        "youtube_title": st.session_state.get(
+            f"pk_title_{task_id}_youtube_shorts"
+        )
+        or "",
+        "youtube_description": youtube_caption,
+        "tags": [],
+    }
+    title = _postiz_caption(task_id, task, "tiktok")
+
+    failures = []
+    with st.spinner(tr("Sending To Postiz")):
+        for video_path in video_files:
+            result = postiz.cross_post_video(
+                video_path=video_path,
+                title=title,
+                youtube_extra=youtube_extra,
+            )
+            if not result.get("success"):
+                failures.append(str(result.get("error") or "unknown error"))
+
+    if failures:
+        st.error(f"{tr('Postiz Send Failed')}: {'; '.join(failures)}")
+    else:
+        st.success(f"{tr('Postiz Send Succeeded')} ({service.post_type})")
+
+
 def _render_publishing_kit(task_id, task, video_files):
     """成片完成后提供“发布物料”：可编辑的标题/描述/标签与视频下载。
 
@@ -1358,6 +1431,8 @@ def _render_publishing_kit(task_id, task, video_files):
                 key=f"pk_dl_{task_id}_{index}",
                 use_container_width=True,
             )
+
+        _render_postiz_publish(task_id, task, video_files)
 
         ready_key = f"pk_ready_{task_id}"
         already = st.session_state.get(ready_key)
@@ -1687,6 +1762,10 @@ def reset_subtitle_settings():
     st.session_state["rounded_subtitle_background_checkbox"] = defaults[
         "rounded_subtitle_background"
     ]
+    st.session_state["word_level_subtitle_checkbox"] = defaults["word_level_subtitle"]
+    st.session_state["subtitle_highlight_color_picker"] = defaults[
+        "subtitle_highlight_color"
+    ]
 
     # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
     for key in (
@@ -1698,6 +1777,8 @@ def reset_subtitle_settings():
         "subtitle_background_enabled",
         "subtitle_background_color",
         "rounded_subtitle_background",
+        "word_level_subtitle",
+        "subtitle_highlight_color",
     ):
         config.ui[key] = defaults[key]
 
@@ -4066,6 +4147,47 @@ def _render_subtitle_settings(panel, params):
                     selected_rounded_subtitle_background
                 )
 
+            # 逐词高亮由 libass 烧录，和整句底板是两套互斥的字幕渲染方式。
+            # 这里只做提示，不强制关闭底板设置，方便用户来回切换比较效果。
+            word_level_cols = st.columns([0.55, 0.45])
+            saved_word_level_subtitle = config.ui.get(
+                "word_level_subtitle",
+                DEFAULT_SUBTITLE_SETTINGS["word_level_subtitle"],
+            )
+            st.session_state.setdefault(
+                "word_level_subtitle_checkbox", saved_word_level_subtitle
+            )
+            with word_level_cols[0]:
+                selected_word_level_subtitle = st.checkbox(
+                    tr("Word Level Subtitle"),
+                    help=tr("Word Level Subtitle Help"),
+                    key="word_level_subtitle_checkbox",
+                    disabled=subtitle_settings_disabled,
+                )
+            params.word_level_subtitle = selected_word_level_subtitle
+            if not subtitle_settings_disabled:
+                config.ui["word_level_subtitle"] = selected_word_level_subtitle
+
+            saved_subtitle_highlight_color = config.ui.get(
+                "subtitle_highlight_color",
+                DEFAULT_SUBTITLE_SETTINGS["subtitle_highlight_color"],
+            )
+            st.session_state.setdefault(
+                "subtitle_highlight_color_picker", saved_subtitle_highlight_color
+            )
+            with word_level_cols[1]:
+                selected_subtitle_highlight_color = st.color_picker(
+                    tr("Subtitle Highlight Color"),
+                    key="subtitle_highlight_color_picker",
+                    disabled=subtitle_settings_disabled
+                    or not selected_word_level_subtitle,
+                )
+            config.ui["subtitle_highlight_color"] = selected_subtitle_highlight_color
+            params.subtitle_highlight_color = selected_subtitle_highlight_color
+
+            if selected_word_level_subtitle and not ass.is_supported():
+                st.warning(tr("Word Level Subtitle Unsupported"))
+
             if video.subtitle_colors_are_indistinguishable(params):
                 # 同色配置仍然是合法的用户选择，因此只在字幕设置区域就近提示，
                 # 不阻止生成。用户可以根据实际视觉需求决定是否继续。
@@ -4367,9 +4489,234 @@ def _render_generation_controls(
     return start_button
 
 
+def _get_stable_widget_value(key, default=None):
+    """Retrieve widget value from session state, taking localized widget key suffixes into account."""
+    w_key = localized_widget_key(key)
+    if w_key in st.session_state and st.session_state[w_key] is not None:
+        return st.session_state[w_key]
+    if key in st.session_state and st.session_state[key] is not None:
+        return st.session_state[key]
+    return default
+
+
+def _apply_channel_profile_to_widgets(ch: ChannelProfile):
+    """Kanala ait tüm özelleştirilmiş ayarları Video Stüdyosu ekranındaki widget'lara yükler."""
+    # 1. Video Dili
+    lang = ch.video_language or "en"
+    _set_stable_widget_value("script_language_select", lang)
+    config.app["video_language"] = lang
+
+    # 2. System Prompt
+    if ch.system_prompt:
+        st.session_state["custom_system_prompt"] = ch.system_prompt
+
+    # 3. Video Kaynağı, Birleştirme Modu & Aspect
+    src = ch.video_source or "pexels"
+    asp = ch.video_aspect or "9:16"
+    _set_stable_widget_value("video_source_select", src)
+    _set_stable_widget_value(f"video_aspect_for_{src}", asp)
+    config.app["video_source"] = src
+
+    if ch.video_concat_mode:
+        _set_stable_widget_value("video_concat_mode_select", ch.video_concat_mode)
+    if ch.video_transition_mode:
+        _set_stable_widget_value("video_transition_mode_select", ch.video_transition_mode)
+
+    if ch.video_clip_duration:
+        _set_stable_widget_value("video_clip_duration_select", int(ch.video_clip_duration))
+
+    # 4. Seslendirme (Voice) ve TTS Sunucusu
+    v_name = ch.voice_name or "en-US-ChristopherNeural-Male"
+    tts_srv = _infer_tts_server_from_voice(v_name)
+    if not tts_srv or tts_srv == voice.NO_VOICE_NAME:
+        tts_srv = "azure-tts-v1"
+    
+    _set_stable_widget_value("voice_mode_control", VOICE_MODE_TTS)
+    _set_stable_widget_value("tts_server_select", tts_srv)
+    _set_stable_widget_value(f"speech_synthesis_select_{tts_srv}", v_name)
+    config.ui["tts_server"] = tts_srv
+    config.ui["voice_name"] = v_name
+
+    if ch.voice_volume is not None:
+        _set_stable_widget_value("voice_volume_select", float(ch.voice_volume))
+
+    # 5. Fon Müziği
+    if ch.bgm_type:
+        _set_stable_widget_value("bgm_type_select", ch.bgm_type)
+    if ch.bgm_volume is not None:
+        _set_stable_widget_value("bgm_volume_select", float(ch.bgm_volume))
+
+    # 6. Altyazı Ayarları
+    st.session_state["subtitle_enabled_checkbox"] = bool(ch.subtitle_enabled)
+    config.ui["subtitle_enabled"] = bool(ch.subtitle_enabled)
+
+    font_name = ch.font_name or "MicrosoftYaHeiBold.ttc"
+    _set_stable_widget_value("font_name_select", font_name)
+    config.ui["font_name"] = font_name
+
+    sub_pos = ch.subtitle_position or "custom"
+    _set_stable_widget_value("subtitle_position_select", sub_pos)
+    config.ui["subtitle_position"] = sub_pos
+
+    cust_pos = float(ch.custom_position if ch.custom_position is not None else 70.0)
+    st.session_state["custom_position_input"] = str(cust_pos)
+    config.ui["custom_position"] = cust_pos
+
+    fore_color = ch.text_fore_color or "#FFFFFF"
+    st.session_state["font_color_picker"] = fore_color
+    config.ui["text_fore_color"] = fore_color
+
+    font_sz = min(100, max(30, int(ch.font_size or 60)))
+    st.session_state["font_size_slider"] = font_sz
+    config.ui["font_size"] = font_sz
+
+    stk_color = ch.stroke_color or "#000000"
+    st.session_state["stroke_color_picker"] = stk_color
+    config.ui["stroke_color"] = stk_color
+
+    stk_width = min(10.0, max(0.0, float(ch.stroke_width if ch.stroke_width is not None else 1.5)))
+    st.session_state["stroke_width_slider"] = stk_width
+    config.ui["stroke_width"] = stk_width
+
+    bg_enabled = bool(ch.subtitle_background_enabled)
+    st.session_state["subtitle_background_enabled_checkbox"] = bg_enabled
+    config.ui["subtitle_background_enabled"] = bg_enabled
+
+    bg_color = ch.subtitle_background_color or "#FFA500"
+    st.session_state["subtitle_background_color_picker"] = bg_color
+    config.ui["subtitle_background_color"] = bg_color
+
+    rnd_bg = bool(ch.rounded_subtitle_background)
+    st.session_state["rounded_subtitle_background_checkbox"] = rnd_bg
+    config.ui["rounded_subtitle_background"] = rnd_bg
+
+
+def _extract_channel_profile_from_current_ui(name: str, niche: str, desc: str = "", prompt: str = "") -> ChannelProfile:
+    """Video Stüdyosu ekranında o an seçili olan tüm görsel ve ses ayarlarını ChannelProfile olarak paketler."""
+    src = _get_stable_widget_value("video_source_select", "pexels")
+    asp = _get_stable_widget_value(f"video_aspect_for_{src}", "9:16")
+    concat_m = _get_stable_widget_value("video_concat_mode_select", "random")
+    trans_m = _get_stable_widget_value("video_transition_mode_select", "none")
+    
+    v_mode = _get_stable_widget_value("voice_mode_control", VOICE_MODE_TTS)
+    tts_srv = _get_stable_widget_value("tts_server_select", "azure-tts-v1")
+    
+    v_name = (
+        _get_stable_widget_value(f"speech_synthesis_select_{tts_srv}")
+        or config.ui.get("voice_name")
+        or "en-US-ChristopherNeural-Male"
+    ) if v_mode == VOICE_MODE_TTS else "no-voice"
+    
+    lang = _get_stable_widget_value("script_language_select") or config.app.get("video_language") or "en"
+    bgm_t = _get_stable_widget_value("bgm_type_select", "random")
+    bgm_v = float(_get_stable_widget_value("bgm_volume_select", 0.2))
+
+    return ChannelProfile(
+        name=name,
+        niche=niche,
+        description=desc,
+        system_prompt=prompt or st.session_state.get("custom_system_prompt", ""),
+        voice_name=v_name,
+        video_aspect=asp,
+        video_language=lang,
+        video_source=src,
+        video_concat_mode=concat_m,
+        video_transition_mode=trans_m,
+        video_clip_duration=int(_get_stable_widget_value("video_clip_duration_select", 4)),
+        font_name=_get_stable_widget_value("font_name_select", "MicrosoftYaHeiBold.ttc"),
+        font_size=int(st.session_state.get("font_size_slider", 60)),
+        text_fore_color=st.session_state.get("font_color_picker", "#FFFFFF"),
+        stroke_color=st.session_state.get("stroke_color_picker", "#000000"),
+        stroke_width=float(st.session_state.get("stroke_width_slider", 1.5)),
+        subtitle_enabled=bool(st.session_state.get("subtitle_enabled_checkbox", True)),
+        subtitle_position=_get_stable_widget_value("subtitle_position_select", "custom"),
+        custom_position=float(st.session_state.get("custom_position_input", 70.0) or 70.0),
+        subtitle_background_enabled=bool(st.session_state.get("subtitle_background_enabled_checkbox", False)),
+        subtitle_background_color=st.session_state.get("subtitle_background_color_picker", "#FFA500"),
+        rounded_subtitle_background=bool(st.session_state.get("rounded_subtitle_background_checkbox", False)),
+        bgm_type=bgm_t,
+        bgm_volume=bgm_v,
+    )
+
+
+def _render_channel_preset_toolbar():
+    """Video Stüdyosu ekranının en üstüne kanal ayarları yükleme ve kaydetme barını ekler."""
+    channels = channel_manager.get_all_channels()
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([3.5, 2, 2, 2.5])
+        with c1:
+            ch_options = {"": "🎯 Kanal Preseti Seçin (Ekran Ayarları)"}
+            for ch in channels:
+                ch_options[ch.id] = f"📺 {ch.name} ({ch.niche or 'Genel'})"
+            
+            selected_id = st.selectbox(
+                "Kanal Preseti Bağlama:",
+                options=list(ch_options.keys()),
+                format_func=lambda x: ch_options[x],
+                key="studio_channel_preset_select",
+                label_visibility="collapsed"
+            )
+        with c2:
+            if st.button("📥 Kanal Ayarlarını Yükle", use_container_width=True, disabled=not selected_id, key="btn_load_channel_preset"):
+                ch = channel_manager.get_channel(selected_id)
+                if ch:
+                    _apply_channel_profile_to_widgets(ch)
+                    st.success(f"🎉 '{ch.name}' kanalının tüm altyazı, ses, font ve medya ayarları ekrana yüklendi!")
+                    st.rerun()
+        with c3:
+            if not selected_id:
+                st.button("💾 Kanalı Güncelle", use_container_width=True, disabled=True, key="btn_update_channel_preset_disabled")
+            else:
+                ch = channel_manager.get_channel(selected_id)
+                ch_name = ch.name if ch else "Seçili Kanal"
+                with st.popover("💾 Kanalı Güncelle", use_container_width=True):
+                    st.warning(f"⚠️ '{ch_name}' kanal presetinin mevcut ayarlarını ekrandaki yeni ayarlarla güncellemek istediğinizden emin misiniz?")
+                    st.caption("Bu işlem kanalın kayıtlı altyazı, ses, font ve medya ayarlarını kalıcı olarak değiştirecektir.")
+                    if st.button(f"✅ Evet, '{ch_name}' Kanalını Güncelle", type="primary", use_container_width=True, key="btn_confirm_update_channel_preset"):
+                        if ch:
+                            updated_ch = _extract_channel_profile_from_current_ui(
+                                name=ch.name,
+                                niche=ch.niche,
+                                desc=ch.description,
+                                prompt=ch.system_prompt
+                            )
+                            updated_ch.id = ch.id
+                            channel_manager.save_channel(updated_ch)
+                            st.success(f"✅ Ekrandaki tüm değişiklikler '{ch.name}' kanal presetine kaydedildi!")
+                            st.rerun()
+        with c4:
+            with st.popover("➕ Ekrandaki Ayarları Yeni Kanal Olarak Kaydet", use_container_width=True):
+                new_ch_name = st.text_input("Kanal Adı *", placeholder="Örn: History Walker HQ")
+                new_ch_niche = st.text_input("Niş / Kategori *", placeholder="Örn: Tarih ve Gizem")
+                if st.button("💾 Kaydet", type="primary", use_container_width=True, key="btn_save_new_channel_from_studio"):
+                    if new_ch_name.strip() and new_ch_niche.strip():
+                        new_ch = _extract_channel_profile_from_current_ui(
+                            name=new_ch_name.strip(),
+                            niche=new_ch_niche.strip()
+                        )
+                        channel_manager.save_channel(new_ch)
+                        st.success(f"🎉 '{new_ch.name}' kanalı ekrandaki tüm ayarlarınızla kaydedildi!")
+                        st.rerun()
+                    else:
+                        st.error("Lütfen Kanal Adı ve Niş alanlarını doldurun.")
+
+
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
     _render_top_bar()
+
+    mode = st.radio(
+        "Mod / Mode",
+        options=["🎬 Video Stüdyosu", "📺 Kanal Yönetim Merkezi"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="app_main_navigation_mode",
+    )
+
+    if mode == "📺 Kanal Yönetim Merkezi":
+        from webui.channel_hub import render_channel_hub
+        render_channel_hub(tr_func=tr)
+        return
 
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()
@@ -4381,6 +4728,8 @@ def _render_application():
     restore_succeeded = st.session_state.pop("task_restore_succeeded", False)
     if restore_applied or restore_succeeded:
         st.success(tr("Task Configuration Loaded"))
+
+    _render_channel_preset_toolbar()
 
     with st.container(key="main_settings_grid"):
         panel = st.columns(4)

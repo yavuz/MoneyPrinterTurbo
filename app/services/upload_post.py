@@ -127,6 +127,11 @@ class UploadPostService:
 upload_post_service = UploadPostService()
 
 
+def get_service() -> UploadPostService:
+    """跨平台发布提供商的统一入口，见 task.cross_post_module()。"""
+    return upload_post_service
+
+
 def cross_post_video(
     video_path: str,
     title: str,

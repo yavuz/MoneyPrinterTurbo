@@ -34,7 +34,9 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import ass as ass_service
 from app.services import bgm as bgm_service
+from app.services import subtitle as subtitle_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
 
@@ -968,6 +970,57 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+def _burn_karaoke_subtitles(
+    rendered_video: str,
+    output_file: str,
+    subtitle_path: str,
+    font_path: str,
+    params: VideoParams,
+    video_width: int,
+    video_height: int,
+) -> bool:
+    """
+    把逐词高亮字幕烧录到已经渲染好的视频上，返回是否成功。
+
+    失败时不抛异常：字幕只是成片的一部分，为此丢掉整段视频不划算。调用方
+    会把无字幕的中间文件直接当成成片，并在日志里留下降级原因。
+    """
+    ass_path = ass_service.ass_file_path(output_file)
+    try:
+        subtitle_items = subtitle_service.file_to_subtitles(subtitle_path)
+        built_path = ass_service.build_karaoke_ass(
+            subtitle_items=subtitle_items,
+            output_path=ass_path,
+            font_path=font_path,
+            font_size=int(params.font_size),
+            video_width=video_width,
+            video_height=video_height,
+            text_color=params.text_fore_color,
+            stroke_color=params.stroke_color,
+            stroke_width=params.stroke_width,
+            highlight_color=getattr(params, "subtitle_highlight_color", "")
+            or "#E11D2E",
+            highlight_text_color=getattr(params, "subtitle_highlight_text_color", ""),
+            subtitle_position=params.subtitle_position,
+            custom_position=params.custom_position,
+            word_timestamps=subtitle_service.load_word_timestamps(subtitle_path),
+        )
+        if not built_path:
+            return False
+        ass_service.burn_subtitles(
+            video_path=rendered_video,
+            ass_path=built_path,
+            output_file=output_file,
+            font_path=font_path,
+            codec=_get_effective_video_codec(),
+            threads=params.n_threads or 2,
+        )
+    except Exception:
+        logger.exception("failed to burn word-level subtitles")
+        return False
+    return True
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1006,6 +1059,14 @@ def generate_video(
             font_path = font_path.replace("\\", "/")
 
         logger.info(f"  ⑤ font: {font_path}")
+
+    # 能力检测必须在渲染之前完成：缺少 libass 时要退回 MoviePy 逐句字幕，
+    # 而那条链路需要在合成阶段就把 TextClip 叠上去，事后没法补。
+    karaoke_enabled = bool(
+        params.subtitle_enabled
+        and getattr(params, "word_level_subtitle", False)
+        and ass_service.is_supported()
+    )
 
     def resolve_subtitle_background_color():
         # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
@@ -1185,7 +1246,10 @@ def generate_video(
                 font_size=params.font_size,
             )
 
-        if subtitle_path and os.path.exists(subtitle_path):
+        if subtitle_path and os.path.exists(subtitle_path) and karaoke_enabled:
+            # 逐词高亮走 libass 烧录，这里不做任何 MoviePy 字幕合成。
+            logger.info("  ⑥ word-level subtitle: rendering with libass")
+        elif subtitle_path and os.path.exists(subtitle_path):
             sub = clip_stack.enter_context(
                 SubtitlesClip(
                     subtitles=subtitle_path,
@@ -1252,9 +1316,19 @@ def generate_video(
         # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
         # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
         output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+        burn_karaoke = karaoke_enabled and bool(
+            subtitle_path and os.path.exists(subtitle_path)
+        )
+        # 需要烧录字幕时，MoviePy 先写一份无字幕的中间文件，再由 FFmpeg 叠字幕。
+        output_root, output_ext = os.path.splitext(output_file)
+        render_target = (
+            f"{output_root}.nosub{output_ext or '.mp4'}"
+            if burn_karaoke
+            else output_file
+        )
         _write_videofile_with_codec_fallback(
             final_video_clip,
-            output_file=output_file,
+            output_file=render_target,
             codec=_get_configured_video_codec(),
             audio_codec=audio_codec,
             audio_fps=output_audio_fps,
@@ -1264,7 +1338,25 @@ def generate_video(
             logger=None,
             fps=fps,
         )
-        return bgm_mix_succeeded
+
+    if burn_karaoke:
+        burned = _burn_karaoke_subtitles(
+            rendered_video=render_target,
+            output_file=output_file,
+            subtitle_path=subtitle_path,
+            font_path=font_path,
+            params=params,
+            video_width=video_width,
+            video_height=video_height,
+        )
+        if burned:
+            delete_files(render_target)
+        else:
+            # 字幕烧录失败时保留无字幕成片，避免整个任务白跑。
+            logger.warning("falling back to a video without word-level subtitles")
+            os.replace(render_target, output_file)
+
+    return bgm_mix_succeeded
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):

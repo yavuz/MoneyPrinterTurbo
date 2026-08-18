@@ -200,5 +200,55 @@ class TestSubtitleService(unittest.TestCase):
         self.assertEqual([item[2] for item in items], ["Hello", "World"])
 
 
+class TestWordTimestampsSidecar(unittest.TestCase):
+    """逐词高亮字幕依赖的词级时间戳旁挂文件。"""
+
+    def test_save_and_load_round_trip(self):
+        words = [
+            {"text": "hello", "start": 0.0, "end": 0.4},
+            {"text": "世界", "start": 0.4, "end": 1.0},
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            saved = subtitle.save_word_timestamps(subtitle_file, words)
+            self.assertEqual(subtitle.word_timestamps_file(subtitle_file), saved)
+            self.assertEqual(words, subtitle.load_word_timestamps(subtitle_file))
+
+    def test_missing_sidecar_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.assertEqual(
+                [], subtitle.load_word_timestamps(str(Path(tmp_dir) / "subtitle.srt"))
+            )
+        self.assertEqual([], subtitle.load_word_timestamps(""))
+
+    def test_corrupt_sidecar_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            Path(subtitle.word_timestamps_file(subtitle_file)).write_text(
+                "not json", encoding="utf-8"
+            )
+            self.assertEqual([], subtitle.load_word_timestamps(subtitle_file))
+
+    def test_entries_without_timings_are_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            subtitle.save_word_timestamps(
+                subtitle_file,
+                [{"text": "ok", "start": 0.0, "end": 0.5}, {"text": "broken"}, "junk"],
+            )
+            self.assertEqual(
+                [{"text": "ok", "start": 0.0, "end": 0.5}],
+                subtitle.load_word_timestamps(subtitle_file),
+            )
+
+    def test_empty_word_list_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            self.assertEqual("", subtitle.save_word_timestamps(subtitle_file, []))
+            self.assertFalse(
+                Path(subtitle.word_timestamps_file(subtitle_file)).exists()
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

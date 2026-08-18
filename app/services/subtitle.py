@@ -65,6 +65,9 @@ def create(audio_file, subtitle_file: str = ""):
 
     start = timer()
     subtitles = []
+    # 逐词高亮字幕需要真实的词级时间戳，这里顺手把 Whisper 已经算出来的结果
+    # 存成旁挂文件。SRT 本身放不下这些信息，而重新跑一次识别代价太高。
+    word_timestamps = []
 
     def recognized(seg_text, seg_start, seg_end):
         seg_text = seg_text.strip()
@@ -89,6 +92,15 @@ def create(audio_file, subtitle_file: str = ""):
         if segment.words:
             is_segmented = False
             for word in segment.words:
+                word_text = word.word.strip()
+                if word_text:
+                    word_timestamps.append(
+                        {
+                            "text": word_text,
+                            "start": float(word.start),
+                            "end": float(word.end),
+                        }
+                    )
                 if not is_segmented:
                     seg_start = word.start
                     is_segmented = True
@@ -140,6 +152,50 @@ def create(audio_file, subtitle_file: str = ""):
     with open(subtitle_file, "w", encoding="utf-8") as f:
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
+
+    save_word_timestamps(subtitle_file, word_timestamps)
+
+
+def word_timestamps_file(subtitle_file: str) -> str:
+    return f"{subtitle_file}.words.json"
+
+
+def save_word_timestamps(subtitle_file: str, word_timestamps: list) -> str:
+    """
+    保存词级时间戳旁挂文件；写失败不影响主流程，逐词字幕会退回按字符权重估算。
+    """
+    if not subtitle_file or not word_timestamps:
+        return ""
+    target_file = word_timestamps_file(subtitle_file)
+    try:
+        with open(target_file, "w", encoding="utf-8") as f:
+            json.dump(word_timestamps, f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning(f"failed to save word timestamps: {e}")
+        return ""
+    return target_file
+
+
+def load_word_timestamps(subtitle_file: str) -> list:
+    """
+    读取词级时间戳。文件不存在（例如 edge 字幕链路）时返回空列表。
+    """
+    target_file = word_timestamps_file(subtitle_file or "")
+    if not target_file or not os.path.isfile(target_file):
+        return []
+    try:
+        with open(target_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning(f"failed to load word timestamps: {e}")
+        return []
+    if not isinstance(data, list):
+        return []
+    return [
+        item
+        for item in data
+        if isinstance(item, dict) and "start" in item and "end" in item
+    ]
 
 
 def file_to_subtitles(filename):

@@ -438,6 +438,25 @@ Output and exit status:
         action=argparse.BooleanOptionalAction,
         help="use a rounded subtitle background (default: disabled)",
     )
+    subtitle_group.add_argument(
+        "--word-level-subtitle",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "keep the whole line on screen and highlight the word being spoken; "
+            "subtitles are burned in with FFmpeg/libass, which ignores the "
+            "subtitle background options (default: disabled)"
+        ),
+    )
+    subtitle_group.add_argument(
+        "--subtitle-highlight-color",
+        type=_hex_color,
+        default=None,
+        help=(
+            "highlight color for --word-level-subtitle, in #RRGGBB format "
+            "(default: #E11D2E)"
+        ),
+    )
 
     execution_group = parser.add_argument_group("execution")
     execution_group.add_argument(
@@ -492,6 +511,14 @@ Output and exit status:
         parser.error(
             "subtitle background color or rounding cannot be enabled together with "
             "--no-subtitle-background-enabled"
+        )
+    if (
+        args.word_level_subtitle is False
+        and args.subtitle_highlight_color is not None
+    ):
+        parser.error(
+            "--subtitle-highlight-color cannot be combined with "
+            "--no-word-level-subtitle"
         )
 
     return args
@@ -555,6 +582,8 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "stroke_color",
         "stroke_width",
         "rounded_subtitle_background",
+        "word_level_subtitle",
+        "subtitle_highlight_color",
     ]
     for name in optional_arg_names:
         value = getattr(args, name)

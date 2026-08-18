@@ -116,6 +116,11 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    # 逐词高亮字幕：整句常驻，当前朗读到的词带高亮色块。开启后字幕改由
+    # FFmpeg/libass 烧录，`text_background_color` 等整句底板参数不再生效。
+    word_level_subtitle: bool = False
+    subtitle_highlight_color: Optional[str] = "#E11D2E"
+    subtitle_highlight_text_color: Optional[str] = ""
 
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"

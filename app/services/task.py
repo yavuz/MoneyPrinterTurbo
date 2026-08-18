@@ -29,7 +29,7 @@ from app.services import (
     video,
     voice,
 )
-from app.services import upload_post
+from app.services import postiz, upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
 
@@ -1031,6 +1031,34 @@ def recover_interrupted_cross_posts(page_size: int = 100) -> int | None:
     return recovered
 
 
+_CROSS_POST_PROVIDERS = {
+    "upload_post": upload_post,
+    "postiz": postiz,
+}
+
+
+def cross_post_module():
+    """
+    返回本次发布使用的提供商模块。
+
+    两个提供商都暴露同样的接口（模块级 `cross_post_video` / `get_service`，
+    服务对象上的 `is_configured` / `platforms` / `auto_upload`），因此发布队列、
+    状态机和中断恢复逻辑对两者完全通用，切换提供商只改这一个入口。
+    """
+    provider = str(config.app.get("cross_post_provider", "upload_post") or "").strip()
+    module = _CROSS_POST_PROVIDERS.get(provider or "upload_post")
+    if module is None:
+        logger.warning(
+            f"unsupported cross_post_provider: {provider}, fallback to upload_post"
+        )
+        return upload_post
+    return module
+
+
+def cross_post_service():
+    return cross_post_module().get_service()
+
+
 def _run_cross_post(
     task_id: str,
     video_paths: tuple[str, ...],
@@ -1080,8 +1108,9 @@ def _run_cross_post(
                 "containsSyntheticMedia": True,
             }
 
+        provider = cross_post_module()
         for video_path in video_paths:
-            result = upload_post.cross_post_video(
+            result = provider.cross_post_video(
                 video_path=video_path,
                 title=video_subject or "Check out this video! #shorts #viral",
                 platforms=list(platforms),
@@ -1090,7 +1119,7 @@ def _run_cross_post(
             if not isinstance(result, dict):
                 result = {
                     "success": False,
-                    "error": "Upload-Post returned an invalid response",
+                    "error": "the cross-post provider returned an invalid response",
                 }
             results.append(result)
 
@@ -1424,15 +1453,9 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    cross_post_enabled = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
-    platforms = (
-        list(upload_post.upload_post_service.platforms)
-        if cross_post_enabled
-        else []
-    )
+    service = cross_post_service()
+    cross_post_enabled = service.is_configured() and service.auto_upload
+    platforms = list(service.platforms) if cross_post_enabled else []
     should_cross_post = cross_post_enabled and bool(platforms)
     if cross_post_enabled and not platforms:
         logger.warning(
@@ -1466,9 +1489,7 @@ def _run_pipeline(
             params=params,
             video_script=video_script,
             platforms=platforms,
-            youtube_privacy_status=(
-                upload_post.upload_post_service.youtube_privacy_status
-            ),
+            youtube_privacy_status=service.youtube_privacy_status,
         )
         # 队列满或线程池关闭属于同步可知的调度失败。任务状态已经由调度函数
         # 更新，这里同步修正返回快照，避免调用方收到与后续查询不一致的 pending。
